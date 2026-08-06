@@ -122,6 +122,10 @@ pub struct TextEngineResult {
     /// original stream would risk a silent under-redaction
     /// (feature plan §9 risk 6, fail closed).
     pub unsupported_font: bool,
+    /// CTM left active after walking the (rewritten) operator list —
+    /// overlays appended after these operators must map page-space
+    /// regions through the inverse of this matrix into stream space.
+    pub final_ctm: Matrix,
 }
 
 /// Stable non-cryptographic hash of a font resource name → the `u32`
@@ -482,6 +486,7 @@ pub fn redact_text_stream(
     }
 
     result.operators = out;
+    result.final_ctm = stack.current().ctm;
     result
 }
 

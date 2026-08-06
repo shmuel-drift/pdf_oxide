@@ -13,9 +13,19 @@
 //! geometry-to-content-stream-bytes step for an already-resolved
 //! (region, fill) pair (SRP). It performs no I/O; the engine appends
 //! these bytes after the pruned content so the overlay is on top.
+//!
+//! When the rewritten content stream leaves a non-identity CTM active,
+//! page-space region coordinates must be mapped through that CTM's
+//! inverse before emission — otherwise the opaque block is painted in
+//! the wrong place (glyphs were classified in page space; overlay ops
+//! are interpreted in stream space).
 
+use super::classify::transform_bbox;
+use super::image_prune::invert_affine;
 use super::options::RedactionOptions;
 use super::region::RedactionRegion;
+use crate::content::graphics_state::Matrix;
+use crate::geometry::Rect;
 use std::fmt::Write as _;
 
 /// Format a coordinate as a PDF real: fixed-point, trailing zeros and a
@@ -51,6 +61,49 @@ fn resolved_fill(region: &RedactionRegion, opts: &RedactionOptions) -> Option<[f
         None if opts.draw_overlay_when_no_ic => Some(opts.default_fill),
         None => None,
     }
+}
+
+/// Map a page-space redaction region into the coordinate space of a
+/// content stream whose active CTM is `ctm`.
+///
+/// Overlay operators are appended at the end of that stream, so their
+/// numbers are interpreted under `ctm`. Glyph classification already
+/// uses page space; this inverse map keeps the opaque block aligned
+/// with the removed content. If `ctm` is singular / non-finite, the
+/// region is returned unchanged (identity CTM is the common case and
+/// is invertible; a degenerate leftover CTM cannot be corrected here).
+pub fn region_in_stream_space(region: &RedactionRegion, ctm: &Matrix) -> RedactionRegion {
+    if ctm == &Matrix::identity() {
+        return *region;
+    }
+    let Some(inv) = invert_affine(ctm) else {
+        return *region;
+    };
+
+    if let Some(qd) = region.quad {
+        let mut out = [0.0_f32; 8];
+        for i in 0..4 {
+            let p = inv.transform_point(qd[i * 2], qd[i * 2 + 1]);
+            out[i * 2] = p.x;
+            out[i * 2 + 1] = p.y;
+        }
+        return RedactionRegion::from_quad(out, region.fill);
+    }
+
+    let page = Rect::from_points(
+        region.bbox[0],
+        region.bbox[1],
+        region.bbox[2],
+        region.bbox[3],
+    );
+    let local = transform_bbox(&page, &inv);
+    RedactionRegion::from_rect(
+        local.left(),
+        local.top(),
+        local.right(),
+        local.bottom(),
+        region.fill,
+    )
 }
 
 /// Content-stream bytes drawing the opaque overlay for one region, or
@@ -163,5 +216,31 @@ mod tests {
         let region = RedactionRegion::from_rect(0.0, 0.0, 1.0, 1.0, Some([0.0, 0.0, 0.0]));
         let ops = s(&region_overlay_ops(&region, &RedactionOptions::default()));
         assert!(ops.starts_with("q\n") && ops.ends_with("Q\n"));
+    }
+
+    #[test]
+    fn y_flip_ctm_maps_page_bbox_to_stream_space() {
+        // Same page-level flip as Word/LibreOffice exports.
+        let ctm = Matrix {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: -1.0,
+            e: 0.0,
+            f: 792.0,
+        };
+        let page = RedactionRegion::from_rect(90.0, 100.0, 400.0, 140.0, Some([1.0, 0.0, 0.0]));
+        let stream = region_in_stream_space(&page, &ctm);
+        // (x, y) → (x, 792 - y): [90,100,400,140] → [90,652,400,692]
+        assert_eq!(stream.bbox[0], 90.0);
+        assert_eq!(stream.bbox[2], 400.0);
+        assert!((stream.bbox[1] - 652.0).abs() < 0.01, "y0={}", stream.bbox[1]);
+        assert!((stream.bbox[3] - 692.0).abs() < 0.01, "y1={}", stream.bbox[3]);
+    }
+
+    #[test]
+    fn identity_ctm_leaves_region_unchanged() {
+        let page = RedactionRegion::from_rect(10.0, 20.0, 30.0, 40.0, None);
+        assert_eq!(region_in_stream_space(&page, &Matrix::identity()), page);
     }
 }

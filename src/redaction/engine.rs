@@ -10,9 +10,13 @@
 //!    (G1/G2). A composite/Type0/unknown font ⇒ **hard refusal**
 //!    (`Err`), never a silent pass-through (feature plan §9 risk 6).
 //! 3. `serialize` re-serializes survivors (binary-safe strings, G6).
-//! 4. `overlay` appends one opaque block per region *after* the pruned
-//!    content so the redacted area is visibly marked (G7) and the
-//!    underlying bytes are already gone — not merely covered.
+//! 4. `overlay` maps each page-space region through the inverse of the
+//!    CTM left active at stream end, then appends one opaque block per
+//!    region *after* the pruned content so the redacted area is visibly
+//!    marked (G7) and the underlying bytes are already gone — not merely
+//!    covered. Mapping is required whenever a leftover `cm` (e.g. a
+//!    page-level Y-flip) would otherwise interpret page coords in the
+//!    wrong space.
 //!
 //! This module owns no document I/O: it is `bytes + regions → bytes`,
 //! so the security guarantee (secret absent from the *output bytes*) is
@@ -22,7 +26,7 @@
 //! enforced there by the existing garbage-collected full rewrite.
 
 use super::options::{RedactionOptions, RedactionReport};
-use super::overlay::region_overlay_ops;
+use super::overlay::{region_in_stream_space, region_overlay_ops};
 use super::region::RegionSet;
 use super::serialize::serialize_operator;
 use super::text_engine::{redact_text_stream, FontMetrics};
@@ -159,7 +163,8 @@ pub fn redact_content_stream(
     }
 
     for region in &regions.regions {
-        body.extend_from_slice(&region_overlay_ops(region, opts));
+        let stream_region = region_in_stream_space(region, &te.final_ctm);
+        body.extend_from_slice(&region_overlay_ops(&stream_region, opts));
     }
 
     let report = RedactionReport {
@@ -303,5 +308,60 @@ mod tests {
             &Stub,
         );
         let _ = redact_content_stream(b"", &regions, &RedactionOptions::default(), &Stub);
+    }
+
+    /// Page-level Y-flip CTM (`1 0 0 -1 0 792 cm`) left active at stream
+    /// end: overlay must emit stream-local coords (inverse of that CTM),
+    /// not raw page-space coords — otherwise the opaque block lands on
+    /// the opposite edge of the page from the removed glyphs.
+    #[test]
+    fn overlay_under_y_flip_ctm_uses_stream_space_coords() {
+        // MediaBox height 792. Local y=680 + flip → page y ≈ 112 (bottom).
+        // Compensating Tm keeps text upright (Word/LibreOffice pattern).
+        let doc = b"\
+1 0 0 -1 0 792 cm\n\
+BT\n\
+/F1 24 Tf\n\
+1 0 0 -1 100 100 Tm\n\
+(KEEP THIS) Tj\n\
+1 0 0 -1 100 680 Tm\n\
+(REDACT ME) Tj\n\
+ET\n";
+        // Page-space box covering the bottom string (not the top one).
+        let regions = one_region(90.0, 100.0, 400.0, 140.0);
+        let (out, report) =
+            redact_content_stream(doc, &regions, &RedactionOptions::default(), &Stub).unwrap();
+        assert!(report.glyphs_removed > 0, "bottom text must be removed");
+        assert_absent(&out, b"REDACT ME");
+        assert!(
+            out.windows(9).any(|w| w == b"KEEP THIS"),
+            "top text must survive: {}",
+            String::from_utf8_lossy(&out)
+        );
+
+        // Inverse of [1 0 0 -1 0 792]: (x, y) → (x, 792-y).
+        // Page [90, 100, 400, 140] → stream [90, 652, 400, 692].
+        let s = String::from_utf8_lossy(&out);
+        let re_line = s
+            .lines()
+            .rev()
+            .find(|l| l.ends_with(" re"))
+            .unwrap_or_else(|| panic!("no overlay re in: {s}"));
+        let parts: Vec<&str> = re_line.split_whitespace().collect();
+        assert!(
+            parts.len() >= 5,
+            "expected 'x y w h re', got: {re_line}"
+        );
+        let y: f32 = parts[1].parse().expect("overlay y");
+        let h: f32 = parts[3].parse().expect("overlay h");
+        assert!(
+            y > 600.0 && y + h < 720.0,
+            "overlay must be in stream space near local y=680 (got y={y} h={h} from {re_line}); \
+             page-space y≈100 would paint at the wrong visual edge under the active Y-flip CTM"
+        );
+        assert!(
+            y > 140.0,
+            "must not emit raw page-space y (got {y} from {re_line})"
+        );
     }
 }
