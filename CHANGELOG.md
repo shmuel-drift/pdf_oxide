@@ -2,6 +2,14 @@
 
 All notable changes to PDFOxide are documented here.
 
+## [0.3.78-fork.1] - 2026-08-06
+
+> Fork pre-release: destructive redaction overlays follow the inverse of a leftover non-identity content-stream CTM (e.g. Word/LibreOffice page Y-flip), so the opaque cover box lands on the same glyphs that were removed.
+
+### Fixed
+
+- **`ApplyRedactions` / `redact_content_stream` painted the opaque overlay in page space while a non-identity CTM was still active at stream end**, so on Y-flipped pages the redaction box appeared on the opposite edge from the removed text. Page-space regions are now mapped through `invert_affine` into stream space before `region_overlay_ops` (regression: `overlay_under_y_flip_ctm_uses_stream_space_coords`).
+
 ## [0.3.77] - 2026-07-27
 
 > Search-index control lands in every first-party binding: `prepare_search()`/`clear_search_index()` (added to the Rust core in 0.3.76 alongside the new per-page search-index cache) can now be called from Python, JavaScript/WASM, Java/Kotlin/Scala/Clojure, Go, Ruby, PHP, Dart, R, Julia, Zig, C#, C++, Swift, Objective-C, and Elixir — not just Rust. `extract_text()`/`to_markdown()`/`to_plain_text()` no longer silently drop `/Artifact`-tagged content (running headers/footers, section identifiers) with no way to opt back in.
