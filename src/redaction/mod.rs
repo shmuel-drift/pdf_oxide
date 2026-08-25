@@ -18,7 +18,9 @@
 pub mod classify;
 pub mod engine;
 pub mod font_scrub;
+pub mod image_burn;
 pub mod image_prune;
+pub mod image_walk;
 pub mod options;
 pub mod overlay;
 pub mod path_prune;

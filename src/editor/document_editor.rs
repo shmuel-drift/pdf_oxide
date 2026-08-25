@@ -18,6 +18,9 @@ use std::io::BufWriter;
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 
+#[path = "image_redact.rs"]
+mod image_redact;
+
 /// Document metadata (Info dictionary).
 #[derive(Debug, Clone, Default)]
 pub struct DocumentInfo {
@@ -495,6 +498,14 @@ pub struct DocumentEditor {
     /// (#231; reachability alone is insufficient because the page is only
     /// repointed transiently during the write).
     redacted_orphan_ids: std::collections::HashSet<u32>,
+    /// Page-local `/Resources/XObject` rebinds after JPEG/Flate pixel burn
+    /// (copy-on-write at save; never mutate a shared parent dict).
+    redacted_xobject_rebinds: HashMap<usize, HashMap<String, ObjectRef>>,
+    /// Pages whose `/Thumb` and `/Alternates` must be dropped on save.
+    redacted_drop_preview: HashSet<usize>,
+    /// Original image/Form object ids replaced by a burn clone; G6'd after
+    /// apply if nothing live still references them.
+    burn_replaced_ids: HashSet<u32>,
     /// Image modifications per page: page_index -> (image_name -> modification)
     image_modifications: HashMap<usize, HashMap<String, ImageModification>>,
     /// Pages where form fields should be flattened
@@ -627,6 +638,9 @@ impl DocumentEditor {
             redaction_regions: HashMap::new(),
             redacted_content: HashMap::new(),
             redacted_orphan_ids: std::collections::HashSet::new(),
+            redacted_xobject_rebinds: HashMap::new(),
+            redacted_drop_preview: HashSet::new(),
+            burn_replaced_ids: HashSet::new(),
             image_modifications: HashMap::new(),
             flatten_forms_pages: std::collections::HashSet::new(),
             remove_acroform: false,
@@ -667,6 +681,9 @@ impl DocumentEditor {
             redaction_regions: HashMap::new(),
             redacted_content: HashMap::new(),
             redacted_orphan_ids: std::collections::HashSet::new(),
+            redacted_xobject_rebinds: HashMap::new(),
+            redacted_drop_preview: HashSet::new(),
+            burn_replaced_ids: HashSet::new(),
             image_modifications: HashMap::new(),
             flatten_forms_pages: std::collections::HashSet::new(),
             remove_acroform: false,
@@ -711,6 +728,9 @@ impl DocumentEditor {
             redaction_regions: HashMap::new(),
             redacted_content: HashMap::new(),
             redacted_orphan_ids: std::collections::HashSet::new(),
+            redacted_xobject_rebinds: HashMap::new(),
+            redacted_drop_preview: HashSet::new(),
+            burn_replaced_ids: HashSet::new(),
             image_modifications: HashMap::new(),
             flatten_forms_pages: std::collections::HashSet::new(),
             remove_acroform: false,
@@ -1812,6 +1832,9 @@ impl DocumentEditor {
         }
 
         while let Some(id) = queue.pop_front() {
+            if self.redacted_orphan_ids.contains(&id) {
+                continue;
+            }
             if !reachable.insert(id) {
                 continue;
             }
@@ -2825,6 +2848,21 @@ impl DocumentEditor {
                                     final_page_obj = Object::Dictionary(new_dict);
                                 }
 
+                                if self.redacted_drop_preview.contains(&source_page_index)
+                                    || self
+                                        .redacted_xobject_rebinds
+                                        .contains_key(&source_page_index)
+                                {
+                                    if let Some(page_dict) = final_page_obj.as_dict() {
+                                        let mut new_dict = page_dict.clone();
+                                        self.patch_page_dict_for_image_burn(
+                                            &mut new_dict,
+                                            source_page_index,
+                                        )?;
+                                        final_page_obj = Object::Dictionary(new_dict);
+                                    }
+                                }
+
                                 // If we're flattening form fields, update page dictionary
                                 if let (
                                     Some((
@@ -3240,53 +3278,66 @@ impl DocumentEditor {
                                         }
                                     }
 
+                                    // Prefer the output page dict's /Resources.
+                                    // Image-burn inlines rebound XObject names on
+                                    // `final_page_obj`; copying from the source page
+                                    // re-emits the original JPEG and the unpatched
+                                    // Resources dict (Intune objects 4 and 8).
+                                    let resources_for_copy = final_page_obj
+                                        .as_dict()
+                                        .and_then(|d| d.get("Resources"))
+                                        .or_else(|| page_dict.get("Resources"));
+
                                     // Write resources if present (as reference)
                                     if let Some(resources_ref) =
-                                        page_dict.get("Resources").and_then(|r| r.as_reference())
+                                        resources_for_copy.and_then(|r| r.as_reference())
                                     {
-                                        let mut resources_obj =
-                                            self.source.load_object(resources_ref)?;
+                                        if !self.redacted_orphan_ids.contains(&resources_ref.id) {
+                                            let mut resources_obj =
+                                                self.source.load_object(resources_ref)?;
 
-                                        // Inject new XObject refs into Resources dict
-                                        if !new_xobject_refs.is_empty() {
-                                            if let Some(res_dict) = resources_obj.as_dict() {
-                                                let mut new_res = res_dict.clone();
-                                                // Resolve existing XObject dict (may be inline or indirect ref)
-                                                let mut xobj_entries = match new_res.get("XObject")
-                                                {
-                                                    Some(Object::Dictionary(d)) => d.clone(),
-                                                    Some(Object::Reference(r)) => self
-                                                        .source
-                                                        .load_object(*r)
-                                                        .ok()
-                                                        .and_then(|o| o.as_dict().cloned())
-                                                        .unwrap_or_default(),
-                                                    _ => HashMap::new(),
-                                                };
-                                                for (name, obj_ref) in &new_xobject_refs {
-                                                    xobj_entries.insert(
-                                                        name.clone(),
-                                                        Object::Reference(*obj_ref),
+                                            // Inject new XObject refs into Resources dict
+                                            if !new_xobject_refs.is_empty() {
+                                                if let Some(res_dict) = resources_obj.as_dict() {
+                                                    let mut new_res = res_dict.clone();
+                                                    // Resolve existing XObject dict (may be inline or indirect ref)
+                                                    let mut xobj_entries = match new_res
+                                                        .get("XObject")
+                                                    {
+                                                        Some(Object::Dictionary(d)) => d.clone(),
+                                                        Some(Object::Reference(r)) => self
+                                                            .source
+                                                            .load_object(*r)
+                                                            .ok()
+                                                            .and_then(|o| o.as_dict().cloned())
+                                                            .unwrap_or_default(),
+                                                        _ => HashMap::new(),
+                                                    };
+                                                    for (name, obj_ref) in &new_xobject_refs {
+                                                        xobj_entries.insert(
+                                                            name.clone(),
+                                                            Object::Reference(*obj_ref),
+                                                        );
+                                                    }
+                                                    new_res.insert(
+                                                        "XObject".to_string(),
+                                                        Object::Dictionary(xobj_entries),
                                                     );
+                                                    resources_obj = Object::Dictionary(new_res);
                                                 }
-                                                new_res.insert(
-                                                    "XObject".to_string(),
-                                                    Object::Dictionary(xobj_entries),
-                                                );
-                                                resources_obj = Object::Dictionary(new_res);
                                             }
-                                        }
 
-                                        let offset = writer.stream_position()?;
-                                        let bytes = serialize_obj(
-                                            &serializer,
-                                            resources_ref.id,
-                                            0,
-                                            &resources_obj,
-                                            &encryption_handler,
-                                        );
-                                        writer.write_all(&bytes)?;
-                                        xref_entries.push((resources_ref.id, offset, 0, true));
+                                            let offset = writer.stream_position()?;
+                                            let bytes = serialize_obj(
+                                                &serializer,
+                                                resources_ref.id,
+                                                0,
+                                                &resources_obj,
+                                                &encryption_handler,
+                                            );
+                                            writer.write_all(&bytes)?;
+                                            xref_entries.push((resources_ref.id, offset, 0, true));
+                                        }
                                     } else if !new_xobject_refs.is_empty() {
                                         // Resources is inline (not a reference) — new XObject refs
                                         // cannot be injected because the page dict was already written.
@@ -3299,7 +3350,7 @@ impl DocumentEditor {
                                     }
 
                                     // Write font objects referenced in Resources (handles inline Resources dict)
-                                    if let Some(resources) = page_dict.get("Resources") {
+                                    if let Some(resources) = resources_for_copy {
                                         let resources_dict = match resources {
                                             Object::Dictionary(d) => Some(d.clone()),
                                             Object::Reference(r) => self
@@ -3372,29 +3423,36 @@ impl DocumentEditor {
                                                 let xobject_dict = match xobjects {
                                                     Object::Dictionary(d) => Some(d.clone()),
                                                     Object::Reference(r) => {
-                                                        let loaded =
+                                                        if self.redacted_orphan_ids.contains(&r.id)
+                                                        {
+                                                            None
+                                                        } else {
+                                                            let loaded =
                                                             self.source.load_object(*r).map_err(|e| {
                                                                 log::warn!("Failed to load resource object {} during save: {}", r.id, e);
                                                                 e
                                                             }).ok();
-                                                        if !written_ids.contains(&r.id) {
-                                                            if let Some(ref obj) = loaded {
-                                                                let offset =
-                                                                    writer.stream_position()?;
-                                                                let bytes = serialize_obj(
-                                                                    &serializer,
-                                                                    r.id,
-                                                                    0,
-                                                                    obj,
-                                                                    &encryption_handler,
-                                                                );
-                                                                writer.write_all(&bytes)?;
-                                                                xref_entries
-                                                                    .push((r.id, offset, 0, true));
-                                                                written_ids.insert(r.id);
+                                                            if !written_ids.contains(&r.id) {
+                                                                if let Some(ref obj) = loaded {
+                                                                    let offset =
+                                                                        writer.stream_position()?;
+                                                                    let bytes = serialize_obj(
+                                                                        &serializer,
+                                                                        r.id,
+                                                                        0,
+                                                                        obj,
+                                                                        &encryption_handler,
+                                                                    );
+                                                                    writer.write_all(&bytes)?;
+                                                                    xref_entries.push((
+                                                                        r.id, offset, 0, true,
+                                                                    ));
+                                                                    written_ids.insert(r.id);
+                                                                }
                                                             }
+                                                            loaded
+                                                                .and_then(|o| o.as_dict().cloned())
                                                         }
-                                                        loaded.and_then(|o| o.as_dict().cloned())
                                                     },
                                                     _ => None,
                                                 };
@@ -3403,10 +3461,23 @@ impl DocumentEditor {
                                                         if let Some(ref_obj) =
                                                             xobj_ref.as_reference()
                                                         {
+                                                            if self
+                                                                .redacted_orphan_ids
+                                                                .contains(&ref_obj.id)
+                                                            {
+                                                                continue;
+                                                            }
                                                             if !written_ids.contains(&ref_obj.id) {
-                                                                if let Ok(xobj_obj) =
-                                                                    self.source.load_object(ref_obj)
-                                                                {
+                                                                let xobj_obj = self
+                                                                    .modified_objects
+                                                                    .get(&ref_obj.id)
+                                                                    .cloned()
+                                                                    .map(Ok)
+                                                                    .unwrap_or_else(|| {
+                                                                        self.source
+                                                                            .load_object(ref_obj)
+                                                                    });
+                                                                if let Ok(xobj_obj) = xobj_obj {
                                                                     let offset =
                                                                         writer.stream_position()?;
                                                                     let bytes = serialize_obj(
@@ -4381,6 +4452,8 @@ impl DocumentEditor {
                     page_index,
                     &crate::redaction::RedactionOptions::default(),
                 )?;
+                let replaced = self.burn_replaced_ids.clone();
+                self.g6_unreferenced_replaced(&replaced);
             }
         } else {
             // Freshly created page — replace the entire content stream.
@@ -6938,6 +7011,9 @@ impl DocumentEditor {
     /// array, if any, is the logical concatenation of its streams,
     /// ISO 32000-1:2008 §7.8.2). Empty if the page has no contents.
     fn get_page_content_bytes(&mut self, source_page: usize) -> Result<Vec<u8>> {
+        if !self.source.is_authenticated() {
+            return Err(Error::EncryptedPdf);
+        }
         let page_ref = self.source.get_page_ref(source_page)?;
         let page_obj = self.source.load_object(page_ref)?;
         let page_dict = page_obj
@@ -6948,20 +7024,33 @@ impl DocumentEditor {
             None => return Ok(Vec::new()),
         };
         match contents {
-            Object::Reference(r) => Ok(self.source.load_object(r)?.decode_stream_data()?),
+            Object::Reference(r) => {
+                let obj = self.source.load_object(r)?;
+                self.source.decode_stream_with_encryption(&obj, r)
+            },
             Object::Array(arr) => {
                 let mut data = Vec::new();
                 for item in arr {
-                    if let Object::Reference(r) = item {
-                        if let Ok(s) = self.source.load_object(r)?.decode_stream_data() {
-                            data.extend_from_slice(&s);
-                            data.push(b'\n');
-                        }
-                    }
+                    let Object::Reference(r) = item else {
+                        return Err(Error::Unsupported(
+                            "page /Contents array item is not a stream reference".to_string(),
+                        ));
+                    };
+                    let obj = self.source.load_object(r)?;
+                    let s = self
+                        .source
+                        .decode_stream_with_encryption(&obj, r)
+                        .map_err(|e| {
+                            Error::Unsupported(format!("failed to decode page /Contents: {e}"))
+                        })?;
+                    data.extend_from_slice(&s);
+                    data.push(b'\n');
                 }
                 Ok(data)
             },
-            _ => Ok(Vec::new()),
+            _ => Err(Error::Unsupported(
+                "page /Contents is neither a stream nor an array of streams".to_string(),
+            )),
         }
     }
 
@@ -7064,7 +7153,11 @@ impl DocumentEditor {
             total.regions += rep.regions;
             total.glyphs_removed += rep.glyphs_removed;
             total.bytes_removed += rep.bytes_removed;
+            total.images_modified += rep.images_modified;
+            total.xobjects_specialized += rep.xobjects_specialized;
         }
+        let replaced = self.burn_replaced_ids.clone();
+        self.g6_unreferenced_replaced(&replaced);
         self.is_modified = true;
         Ok(total)
     }
@@ -7080,7 +7173,12 @@ impl DocumentEditor {
         src: usize,
         opts: &crate::redaction::RedactionOptions,
     ) -> Result<crate::redaction::RedactionReport> {
-        use crate::redaction::{redact_content_stream, RedactionRegion, RegionSet};
+        use crate::content::graphics_state::Matrix;
+        use crate::content::parser::parse_content_stream;
+        use crate::redaction::overlay::{region_in_stream_space, region_overlay_ops};
+        use crate::redaction::serialize::serialize_operator;
+        use crate::redaction::text_engine::redact_text_stream;
+        use crate::redaction::{RedactionRegion, RegionSet};
         let mut rs = RegionSet::new(src);
         for rd in self.get_redaction_data(src)? {
             rs.push(RedactionRegion::from_rect(
@@ -7101,10 +7199,72 @@ impl DocumentEditor {
         }
         let content = self.get_page_content_bytes(src)?;
         if content.is_empty() {
-            return Ok(crate::redaction::RedactionReport::default());
+            self.queue_drop_page_preview(src)?;
+            self.apply_redactions_pages.insert(src);
+            return Ok(crate::redaction::RedactionReport {
+                regions: rs.len(),
+                ..crate::redaction::RedactionReport::default()
+            });
         }
         let fonts = self.build_page_font_metrics(src)?;
-        let (bytes, rep) = redact_content_stream(&content, &rs, opts, &fonts)?;
+        let ops = parse_content_stream(&content)?;
+        let te = redact_text_stream(&ops, &rs, opts.edge_padding, &fonts);
+        if te.unsupported_font {
+            return Err(Error::Unsupported(
+                "destructive text redaction of composite/Type0 font content is not yet \
+                 supported; refusing rather than risk leaving recoverable text"
+                    .to_string(),
+            ));
+        }
+
+        let objects_snapshot = self.modified_objects.clone();
+        let next_id_snapshot = self.next_object_id;
+        let orphans_snapshot = self.redacted_orphan_ids.clone();
+        let rebinds_snapshot = self.redacted_xobject_rebinds.clone();
+        let drop_snapshot = self.redacted_drop_preview.clone();
+        let replaced_snapshot = self.burn_replaced_ids.clone();
+        let final_ctm = te.final_ctm;
+        let glyphs_removed = te.glyphs_removed;
+        let bytes_removed = te.bytes_removed;
+
+        let burn = {
+            let result = (|| {
+                self.queue_drop_page_preview(src)?;
+                let resources = self.resolve_page_resources(src)?;
+                let mut visiting = std::collections::HashSet::new();
+                self.burn_stream(
+                    te.operators,
+                    &resources,
+                    Matrix::identity(),
+                    &rs,
+                    opts.edge_padding,
+                    &mut visiting,
+                    0,
+                )
+            })();
+            match result {
+                Ok(b) => b,
+                Err(e) => {
+                    self.modified_objects = objects_snapshot;
+                    self.next_object_id = next_id_snapshot;
+                    self.redacted_orphan_ids = orphans_snapshot;
+                    self.redacted_xobject_rebinds = rebinds_snapshot;
+                    self.redacted_drop_preview = drop_snapshot;
+                    self.burn_replaced_ids = replaced_snapshot;
+                    return Err(e);
+                },
+            }
+        };
+
+        let mut body = Vec::with_capacity(content.len());
+        for op in &burn.ops {
+            serialize_operator(&mut body, op);
+        }
+        for region in &rs.regions {
+            let stream_region = region_in_stream_space(region, &final_ctm);
+            body.extend_from_slice(&region_overlay_ops(&stream_region, opts));
+        }
+
         // Record the original /Contents object ids so the save path
         // hard-drops them (G6) — the secret must not survive even as
         // an orphaned, GC-missed object.
@@ -7127,10 +7287,22 @@ impl DocumentEditor {
                 }
             }
         }
-        self.redacted_content.insert(src, bytes);
+        self.redacted_content.insert(src, body);
         self.apply_redactions_pages.insert(src);
+        if !burn.xobject_rebinds.is_empty() {
+            self.redacted_xobject_rebinds
+                .insert(src, burn.xobject_rebinds);
+        }
+        self.burn_replaced_ids.extend(burn.replaced_ids);
         self.is_modified = true;
-        Ok(rep)
+        Ok(crate::redaction::RedactionReport {
+            regions: rs.len(),
+            glyphs_removed,
+            bytes_removed,
+            images_modified: burn.images_modified,
+            xobjects_specialized: burn.xobjects_specialized,
+            ..crate::redaction::RedactionReport::default()
+        })
     }
 
     /// Standalone document sanitization without geometric redaction
