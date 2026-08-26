@@ -14,13 +14,13 @@ use std::collections::HashMap;
 
 /// JPEG quality for re-encoded burned images (near-lossless; MCU pad
 /// is what stops ringing from restoring secret samples).
-pub const JPEG_BURN_QUALITY: u8 = 95;
+pub(crate) const JPEG_BURN_QUALITY: u8 = 95;
 
 /// JPEG MCU block size used for wipe expansion (ISO JPEG 8×8).
-pub const JPEG_MCU: u32 = 8;
+pub(crate) const JPEG_MCU: u32 = 8;
 
 /// Maximum Form XObject recursion depth while burning.
-pub const MAX_FORM_DEPTH: u32 = 32;
+pub(crate) const MAX_FORM_DEPTH: u32 = 32;
 
 /// Re-encoded image ready to wrap as a new Image XObject.
 #[derive(Debug, Clone)]
