@@ -9,12 +9,12 @@
 //! the CTM, ISO §8.9.5).
 //!
 //! This module is the *pure planning primitive*: affine inversion plus a
-//! Keep / DeleteFull / Overwrite-fraction decision. It performs no decode
-//! or re-encode (that integration is a later increment) and is not wired
-//! into any redaction decision, so it cannot itself under-redact. Result
-//! fractions are in the image's normalized `[0,1]²` space; the decode
-//! step applies the correct row orientation to actual pixels. Reuses
-//! `classify`/`region`/`Matrix` (DRY); pure deterministic math.
+//! Keep / DeleteFull / Overwrite-fraction decision. Pixel burn consumes
+//! [`classify_image_wipes`] (one hole per user rectangle).
+//! [`classify_image_placement`] is the legacy AABB-union helper for
+//! intersection-only checks (inline `BI`, unknown XObject subtype).
+//! Result fractions are in the image's normalized `[0,1]²` space; the
+//! decode step applies the correct row orientation to actual pixels.
 
 use super::classify::{classify, transform_bbox, Classification};
 use super::region::RegionSet;
@@ -88,6 +88,74 @@ fn clamp01(x: f32) -> f32 {
     }
 }
 
+fn overwrite_from_padded(inv: &Matrix, padded: &Rect) -> ImageRedaction {
+    let mut u0 = f32::INFINITY;
+    let mut v0 = f32::INFINITY;
+    let mut u1 = f32::NEG_INFINITY;
+    let mut v1 = f32::NEG_INFINITY;
+    for (px, py) in [
+        (padded.left(), padded.top()),
+        (padded.right(), padded.top()),
+        (padded.right(), padded.bottom()),
+        (padded.left(), padded.bottom()),
+    ] {
+        let p: Point = inv.transform_point(px, py);
+        u0 = u0.min(p.x);
+        v0 = v0.min(p.y);
+        u1 = u1.max(p.x);
+        v1 = v1.max(p.y);
+    }
+    let (cu0, cv0, cu1, cv1) = (clamp01(u0), clamp01(v0), clamp01(u1), clamp01(v1));
+    if cu0 <= 0.0 && cv0 <= 0.0 && cu1 >= 1.0 && cv1 >= 1.0 {
+        ImageRedaction::DeleteFull
+    } else {
+        ImageRedaction::Overwrite {
+            u0: cu0,
+            v0: cv0,
+            u1: cu1,
+            v1: cv1,
+        }
+    }
+}
+
+/// Per-region wipes for one image placement (multi-select boxes).
+///
+/// Empty → `Keep`. A `DeleteFull` entry means the whole image must be
+/// destroyed. Otherwise each `Overwrite` is one user rectangle, **not**
+/// the AABB of all of them.
+pub fn classify_image_wipes(
+    image_ctm: &Matrix,
+    regions: &RegionSet,
+    min_padding: f32,
+) -> Vec<ImageRedaction> {
+    let unit = Rect::from_points(0.0, 0.0, 1.0, 1.0);
+    match classify(&unit, image_ctm, regions, min_padding) {
+        Classification::Outside => Vec::new(),
+        Classification::Inside => vec![ImageRedaction::DeleteFull],
+        Classification::Straddle => {
+            let Some(inv) = invert_affine(image_ctm) else {
+                return vec![ImageRedaction::DeleteFull];
+            };
+            let dev_img = transform_bbox(&unit, image_ctm);
+            let mut out = Vec::new();
+            for r in &regions.regions {
+                let padded = r.padded_rect(min_padding);
+                if !padded.intersects(&dev_img) {
+                    continue;
+                }
+                match overwrite_from_padded(&inv, &padded) {
+                    ImageRedaction::DeleteFull => {
+                        return vec![ImageRedaction::DeleteFull];
+                    },
+                    ImageRedaction::Keep => {},
+                    w @ ImageRedaction::Overwrite { .. } => out.push(w),
+                }
+            }
+            out
+        },
+    }
+}
+
 /// Decide what to do with an image whose unit square is mapped to the
 /// page by `image_ctm` (the composed CTM at the `Do`/`BI`), against the
 /// page's regions.
@@ -96,68 +164,48 @@ fn clamp01(x: f32) -> f32 {
 /// - `DeleteFull` — a region fully contains the placement, or the CTM is
 ///   singular while the placement intersects a region (fail-safe:
 ///   destroy rather than risk leaving recoverable pixels).
-/// - `Overwrite`  — the `[0,1]²` sub-rectangle (union over intersecting
-///   regions, clamped to the image) whose pixels must be destroyed.
+/// - `Overwrite`  — **AABB union** of intersecting regions (legacy single
+///   rect). Pixel burn MUST use [`classify_image_wipes`] instead so
+///   disjoint marks do not fill the gap between them.
 pub fn classify_image_placement(
     image_ctm: &Matrix,
     regions: &RegionSet,
     min_padding: f32,
 ) -> ImageRedaction {
-    // The image occupies the unit square in its own space.
-    let unit = Rect::from_points(0.0, 0.0, 1.0, 1.0);
-    match classify(&unit, image_ctm, regions, min_padding) {
-        Classification::Outside => ImageRedaction::Keep,
-        Classification::Inside => ImageRedaction::DeleteFull,
-        Classification::Straddle => {
-            let Some(inv) = invert_affine(image_ctm) else {
-                // Cannot map device→image space: over-redact (destroy).
-                return ImageRedaction::DeleteFull;
-            };
-            // Union of each intersecting region's padded box, mapped back
-            // into image [0,1]² space and clamped.
-            let mut u0 = f32::INFINITY;
-            let mut v0 = f32::INFINITY;
-            let mut u1 = f32::NEG_INFINITY;
-            let mut v1 = f32::NEG_INFINITY;
-            let mut any = false;
-            for r in &regions.regions {
-                let padded = r.padded_rect(min_padding);
-                // Does this region's device box meet the image at all?
-                let dev_img = transform_bbox(&unit, image_ctm);
-                if !padded.intersects(&dev_img) {
-                    continue;
-                }
-                any = true;
-                for (px, py) in [
-                    (padded.left(), padded.top()),
-                    (padded.right(), padded.top()),
-                    (padded.right(), padded.bottom()),
-                    (padded.left(), padded.bottom()),
-                ] {
-                    let p: Point = inv.transform_point(px, py);
-                    u0 = u0.min(p.x);
-                    v0 = v0.min(p.y);
-                    u1 = u1.max(p.x);
-                    v1 = v1.max(p.y);
-                }
-            }
-            if !any {
-                return ImageRedaction::Keep;
-            }
-            let (cu0, cv0, cu1, cv1) = (clamp01(u0), clamp01(v0), clamp01(u1), clamp01(v1));
-            // A region that, mapped back, covers the whole unit square ⇒
-            // delete (equivalent to full cover; avoids a no-op Overwrite).
-            if cu0 <= 0.0 && cv0 <= 0.0 && cu1 >= 1.0 && cv1 >= 1.0 {
-                ImageRedaction::DeleteFull
-            } else {
-                ImageRedaction::Overwrite {
-                    u0: cu0,
-                    v0: cv0,
-                    u1: cu1,
-                    v1: cv1,
-                }
-            }
-        },
+    let wipes = classify_image_wipes(image_ctm, regions, min_padding);
+    if wipes.is_empty() {
+        return ImageRedaction::Keep;
+    }
+    if wipes
+        .iter()
+        .any(|w| matches!(w, ImageRedaction::DeleteFull))
+    {
+        return ImageRedaction::DeleteFull;
+    }
+    let mut u0 = f32::INFINITY;
+    let mut v0 = f32::INFINITY;
+    let mut u1 = f32::NEG_INFINITY;
+    let mut v1 = f32::NEG_INFINITY;
+    let mut any = false;
+    for w in wipes {
+        if let ImageRedaction::Overwrite {
+            u0: a0,
+            v0: b0,
+            u1: a1,
+            v1: b1,
+        } = w
+        {
+            any = true;
+            u0 = u0.min(a0);
+            v0 = v0.min(b0);
+            u1 = u1.max(a1);
+            v1 = v1.max(b1);
+        }
+    }
+    if !any {
+        ImageRedaction::Keep
+    } else {
+        ImageRedaction::Overwrite { u0, v0, u1, v1 }
     }
 }
 
@@ -355,5 +403,30 @@ mod tests {
         regions.push(RedactionRegion::from_rect(0.0, 0.0, 10.0, 10.0, None));
         let _ = classify_image_placement(&ctm, &regions, DEFAULT_EDGE_PADDING);
         let _ = invert_affine(&ctm);
+    }
+
+    #[test]
+    fn two_disjoint_regions_are_two_wipes_not_one_union() {
+        let ctm = scale_at(100.0, 100.0, 0.0, 0.0);
+        let mut regions = RegionSet::new(0);
+        regions.push(RedactionRegion::from_rect(0.0, 0.0, 20.0, 100.0, None));
+        regions.push(RedactionRegion::from_rect(80.0, 0.0, 100.0, 100.0, None));
+        let wipes = classify_image_wipes(&ctm, &regions, 0.0);
+        assert_eq!(wipes.len(), 2, "expected one Overwrite per region, got {wipes:?}");
+        for w in &wipes {
+            match w {
+                ImageRedaction::Overwrite { u0, u1, .. } => {
+                    let covers_middle = *u0 <= 0.45 && *u1 >= 0.55;
+                    assert!(!covers_middle, "a single wipe must not span the gap, got {w:?}");
+                },
+                other => panic!("expected Overwrite, got {other:?}"),
+            }
+        }
+        match classify_image_placement(&ctm, &regions, 0.0) {
+            ImageRedaction::Overwrite { u0, u1, .. } => {
+                assert!(u0 <= 0.05 && u1 >= 0.95, "legacy API still unions, got {u0}..{u1}");
+            },
+            other => panic!("legacy union should be one Overwrite, got {other:?}"),
+        }
     }
 }

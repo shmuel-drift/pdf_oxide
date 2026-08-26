@@ -1,24 +1,28 @@
-//! True / destructive redaction and document sanitization (#231).
+//! True / destructive redaction (#231).
 //!
 //! Replaces the prior *cosmetic* redaction (a filled rectangle drawn over
 //! content whose underlying bytes survived) with physical content removal
-//! and a document-wide sanitization pass, per ISO 32000-1:2008 §12.5.6.23:
-//! *"shall remove all traces of the specified content … clipping or image
-//! masks shall not be used to hide that data."*
+//! per ISO 32000-1:2008 §12.5.6.23: *"shall remove all traces of the
+//! specified content … clipping or image masks shall not be used to hide
+//! that data."*
 //!
-//! The capability is built incrementally per the feature plan tracked in
-//! <https://github.com/yfedoseev/pdf_oxide/issues/231>. One responsibility
-//! per submodule (SRP); the geometric region model lands first and is the
-//! shared input to every pruner. The
-//! pruners (text/image/path/xobject), the font scrubber, the sanitizer and
-//! the orchestrating engine follow as subsequent submodules.
+//! `apply_redactions_destructive` removes intersecting vector text and
+//! burns JPEG/Flate image pixels under each rectangle, then paints an
+//! opaque overlay. Path prune is still planning-only (`path_prune`).
+//! Document sanitization (`sanitize_catalog` / `sanitize_document`) is a
+//! **separate** API — apply does not run it.
+//!
+//! One responsibility per submodule (SRP). The geometric region model is
+//! the shared input to text, image, and overlay.
 
 #![forbid(unsafe_code)]
 
 pub mod classify;
 pub mod engine;
 pub mod font_scrub;
+pub mod image_burn;
 pub mod image_prune;
+pub mod image_walk;
 pub mod options;
 pub mod overlay;
 pub mod path_prune;
