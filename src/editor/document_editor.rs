@@ -18,6 +18,8 @@ use std::io::BufWriter;
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 
+// Same-module split: image_redact needs private DocumentEditor fields.
+// A directory module would be a 7k-line file move; keep this include.
 #[path = "image_redact.rs"]
 mod image_redact;
 
@@ -500,7 +502,7 @@ pub struct DocumentEditor {
     redacted_orphan_ids: std::collections::HashSet<u32>,
     /// Page-local `/Resources/XObject` rebinds after JPEG/Flate pixel burn
     /// (copy-on-write at save; never mutate a shared parent dict).
-    redacted_xobject_rebinds: HashMap<usize, HashMap<String, ObjectRef>>,
+    redacted_xobject_rebinds: HashMap<usize, image_redact::XObjectPatch>,
     /// Pages whose `/Thumb` and `/Alternates` must be dropped on save.
     redacted_drop_preview: HashSet<usize>,
     /// Original image/Form object ids replaced by a burn clone; G6'd after
@@ -3282,7 +3284,7 @@ impl DocumentEditor {
                                     // Image-burn inlines rebound XObject names on
                                     // `final_page_obj`; copying from the source page
                                     // re-emits the original JPEG and the unpatched
-                                    // Resources dict (Intune objects 4 and 8).
+                                    // Resources dict.
                                     let resources_for_copy = final_page_obj
                                         .as_dict()
                                         .and_then(|d| d.get("Resources"))
@@ -7289,9 +7291,9 @@ impl DocumentEditor {
         }
         self.redacted_content.insert(src, body);
         self.apply_redactions_pages.insert(src);
-        if !burn.xobject_rebinds.is_empty() {
+        if !burn.xobject_patch.is_empty() {
             self.redacted_xobject_rebinds
-                .insert(src, burn.xobject_rebinds);
+                .insert(src, burn.xobject_patch);
         }
         self.burn_replaced_ids.extend(burn.replaced_ids);
         self.is_modified = true;

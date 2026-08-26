@@ -124,7 +124,7 @@ fn save_raw(ed: &mut DocumentEditor) -> Vec<u8> {
 fn extracted_rgb(pdf: &[u8], page: usize) -> Vec<image::RgbImage> {
     let doc = PdfDocument::from_bytes(pdf.to_vec()).expect("open");
     doc.extract_images(page)
-        .unwrap_or_default()
+        .expect("extract_images")
         .into_iter()
         .filter_map(|im| im.to_dynamic_image().ok().map(|d| d.to_rgb8()))
         .collect()
@@ -167,8 +167,8 @@ fn jpeg_full_page_burn_destroys_secret_pixels() {
 
 #[test]
 fn jpeg_indirect_resources_drops_original_stream() {
-    // Intune-class: page /Resources is an indirect dict. Burning the only
-    // Do must drop both the original JPEG and that Resources object.
+    // Indirect page /Resources dict. Burning the only Do must drop both
+    // the original JPEG and that Resources object.
     let w = 32u32;
     let h = 32u32;
     let jpeg = encode_jpeg_rgb(w, h, &magenta_on_green(w, h));
@@ -306,6 +306,91 @@ fn jpeg_inside_form_is_burned() {
         .expect("form apply");
     let out = save_raw(&mut ed);
     assert!(!has_magenta(&extracted_rgb(&out, 0)));
+    assert!(
+        !contains_bytes(&out, &jpeg),
+        "original JPEG stream must be absent after form burn (G6)"
+    );
+}
+
+#[test]
+fn form_page_scale_form_translate_maps_holes() {
+    // Crate multiply is self-then-other (same as `cm`): Form /Matrix T(2,1)
+    // then page S(32) → image at [64,32]–[96,64]. Swapped order would put
+    // it at [2,1]–[34,33].
+    let jpeg = encode_jpeg_rgb(32, 32, &magenta_on_green(32, 32));
+    let page_c = b"q 32 0 0 32 0 0 cm /Fm1 Do Q";
+    let form_c = b"q /Im1 Do Q";
+    let pdf = assemble_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>\n".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 120 80] \
+           /Contents 4 0 R /Resources << /XObject << /Fm1 5 0 R >> >> >>\n"
+            .to_vec(),
+        stream_obj("", page_c),
+        stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 1 1] /Matrix [1 0 0 1 2 1] \
+             /Resources << /XObject << /Im1 6 0 R >> >>",
+            form_c,
+        ),
+        image_xobject("DCTDecode", 32, 32, "DeviceRGB", 8, &jpeg),
+    ]);
+
+    let mut ed = DocumentEditor::from_bytes(pdf.clone()).unwrap();
+    ed.add_redaction(0, [64.0, 32.0, 96.0, 64.0], None).unwrap();
+    ed.apply_redactions_destructive(RedactionOptions::default())
+        .expect("correct-order box");
+    let out = save_raw(&mut ed);
+    assert!(
+        !has_magenta(&extracted_rgb(&out, 0)),
+        "T then S must map the image onto [64,32,96,64]"
+    );
+
+    let mut ed_wrong = DocumentEditor::from_bytes(pdf).unwrap();
+    ed_wrong
+        .add_redaction(0, [2.0, 1.0, 34.0, 33.0], None)
+        .unwrap();
+    ed_wrong
+        .apply_redactions_destructive(RedactionOptions::default())
+        .expect("swapped-order box");
+    let out_wrong = save_raw(&mut ed_wrong);
+    assert!(
+        has_magenta(&extracted_rgb(&out_wrong, 0)),
+        "S then T rect must not wipe the secret under this crate's multiply"
+    );
+}
+
+#[test]
+fn flate_then_dct_filter_chain_burns() {
+    let w = 32u32;
+    let h = 32u32;
+    let jpeg = encode_jpeg_rgb(w, h, &magenta_on_green(w, h));
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(&jpeg).unwrap();
+    let wrapped = enc.finish().unwrap();
+    let contents = format!("q {w} 0 0 {h} 0 0 cm /Im1 Do Q");
+    let pdf = assemble_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>\n".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} {h}] \
+             /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >>\n"
+        )
+        .into_bytes(),
+        stream_obj("", contents.as_bytes()),
+        stream_obj(
+            "/Type /XObject /Subtype /Image /Width 32 /Height 32 \
+             /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter [/FlateDecode /DCTDecode]",
+            &wrapped,
+        ),
+    ]);
+
+    let mut ed = DocumentEditor::from_bytes(pdf).unwrap();
+    ed.add_redaction(0, [0.0, 0.0, w as f32, h as f32], None)
+        .unwrap();
+    ed.apply_redactions_destructive(RedactionOptions::default())
+        .expect("flate+dct apply");
+    let out = save_raw(&mut ed);
+    assert!(!has_magenta(&extracted_rgb(&out, 0)), "Flate+DCT secret survived");
 }
 
 #[test]
@@ -353,6 +438,39 @@ fn two_do_same_name_only_intersecting_placement_burns() {
     assert!(
         contains_bytes(&out, &jpeg),
         "shared Do that stays original must keep the pre-burn JPEG stream"
+    );
+}
+
+#[test]
+fn shared_do_all_placements_burned_drops_original_stream() {
+    let w = 16u32;
+    let h = 16u32;
+    let jpeg = encode_jpeg_rgb(w, h, &magenta_on_green(w, h));
+    let contents = "q 16 0 0 16 0 0 cm /Im1 Do Q q 16 0 0 16 32 0 cm /Im1 Do Q";
+    let pdf = assemble_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>\n".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 48 16] \
+           /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >>\n"
+            .to_vec(),
+        stream_obj("", contents.as_bytes()),
+        image_xobject("DCTDecode", w, h, "DeviceRGB", 8, &jpeg),
+    ]);
+
+    let mut ed = DocumentEditor::from_bytes(pdf).unwrap();
+    ed.add_redaction(0, [0.0, 0.0, 16.0, 16.0], None).unwrap();
+    ed.add_redaction(0, [32.0, 0.0, 48.0, 16.0], None).unwrap();
+    ed.apply_redactions_destructive(RedactionOptions::default())
+        .expect("apply");
+    let out = save_raw(&mut ed);
+    assert!(!has_magenta(&extracted_rgb(&out, 0)), "every extracted image must be burned");
+    assert!(
+        !contains_bytes(&out, &jpeg),
+        "original JPEG must be gone when every shared Do was burned"
+    );
+    assert!(
+        !contains_bytes(&out, b"/Im1 5 0 R"),
+        "unused original XObject name must be dropped from /Resources"
     );
 }
 
@@ -481,7 +599,6 @@ fn jbig2_intersecting_fails_no_output_mutation() {
         stream_obj("", contents),
         image_xobject("JBIG2Decode", 32, 32, "DeviceGray", 1, dummy),
     ]);
-    let original = src.clone();
     let mut ed = DocumentEditor::from_bytes(src).unwrap();
     ed.add_redaction(0, [0.0, 0.0, 32.0, 32.0], None).unwrap();
     assert!(ed
@@ -492,14 +609,39 @@ fn jbig2_intersecting_fails_no_output_mutation() {
         out.windows(dummy.len()).any(|w| w == dummy),
         "JBIG2 bytes must remain (apply failed; no burn)"
     );
-    let _ = original;
 }
 
 #[test]
-fn overlay_y_flip_engine_still_green() {
-    // Guard: the engine overlay test lives in-unit; this just keeps the
-    // integration crate compiling against RedactionOptions after image burn.
-    let _ = RedactionOptions::default();
+fn apply_overlay_under_y_flip_ctm() {
+    // Leftover page Y-flip *after* the image q/Q so image CTM is unchanged.
+    // Partial box: full-page [0,0,W,H] maps to itself under this flip.
+    let w = 32u32;
+    let h = 32u32;
+    let jpeg = encode_jpeg_rgb(w, h, &magenta_on_green(w, h));
+    let extra = format!(" 1 0 0 -1 0 {h} cm");
+    let src = jpeg_page_pdf(w, h, &jpeg, &extra, None);
+    let mut ed = DocumentEditor::from_bytes(src).unwrap();
+    ed.add_redaction(0, [0.0, 0.0, w as f32, 12.0], None)
+        .unwrap();
+    ed.apply_redactions_destructive(RedactionOptions::default())
+        .expect("apply");
+    let out = save_raw(&mut ed);
+    let doc = PdfDocument::from_bytes(out).expect("reopen");
+    let content = doc.get_page_content_data(0).expect("contents");
+    let s = String::from_utf8_lossy(&content);
+    let re_line = s
+        .lines()
+        .rev()
+        .find(|l| l.trim_end().ends_with(" re"))
+        .unwrap_or_else(|| panic!("no overlay re in: {s}"));
+    let parts: Vec<&str> = re_line.split_whitespace().collect();
+    assert!(parts.len() >= 5, "expected 'x y w h re', got: {re_line}");
+    let y: f32 = parts[1].parse().expect("overlay y");
+    let hh: f32 = parts[3].parse().expect("overlay h");
+    assert!(
+        y > 12.0 && y + hh <= h as f32 + 1.0,
+        "overlay must be in stream space (inverse of Y-flip), got y={y} h={hh} from {re_line}"
+    );
 }
 
 #[test]

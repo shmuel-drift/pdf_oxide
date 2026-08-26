@@ -39,10 +39,16 @@ pub struct BurnedJpeg {
 pub fn filter_names(dict: &HashMap<String, Object>) -> Vec<String> {
     match dict.get("Filter") {
         Some(Object::Name(n)) => vec![n.clone()],
-        Some(Object::Array(arr)) => arr
-            .iter()
-            .filter_map(|f| f.as_name().map(str::to_string))
-            .collect(),
+        Some(Object::Array(arr)) => {
+            let mut names = Vec::with_capacity(arr.len());
+            for f in arr {
+                match f.as_name() {
+                    Some(n) => names.push(n.to_string()),
+                    None => return vec!["<invalid>".to_string()],
+                }
+            }
+            names
+        },
         None => Vec::new(),
         Some(_) => vec!["<invalid>".to_string()],
     }
@@ -138,40 +144,6 @@ fn mcu_align(x0: u32, y0: u32, x1: u32, y1: u32, width: u32, height: u32) -> (u3
     (x0, y0, x1.max(x0), y1.max(y0))
 }
 
-/// AABB union of wipe decisions. **Not** the burn path — pixel burn
-/// applies each overwrite separately ([`burn_image_wipes`]).
-pub fn union_wipes(wipes: impl IntoIterator<Item = ImageRedaction>) -> ImageRedaction {
-    let mut acc = ImageRedaction::Keep;
-    for w in wipes {
-        acc = match (acc, w) {
-            (ImageRedaction::Keep, x) | (x, ImageRedaction::Keep) => x,
-            (ImageRedaction::DeleteFull, _) | (_, ImageRedaction::DeleteFull) => {
-                ImageRedaction::DeleteFull
-            },
-            (
-                ImageRedaction::Overwrite {
-                    u0: a0,
-                    v0: b0,
-                    u1: a1,
-                    v1: b1,
-                },
-                ImageRedaction::Overwrite {
-                    u0: c0,
-                    v0: d0,
-                    u1: c1,
-                    v1: d1,
-                },
-            ) => ImageRedaction::Overwrite {
-                u0: a0.min(c0),
-                v0: b0.min(d0),
-                u1: a1.max(c1),
-                v1: b1.max(d1),
-            },
-        };
-    }
-    acc
-}
-
 fn extracted_is_cmyk(image: &PdfImage) -> bool {
     if image.color_space().components() == 4 {
         return true;
@@ -239,7 +211,7 @@ pub fn burn_image(image: &PdfImage, redaction: ImageRedaction) -> Result<BurnedJ
 ///
 /// Each `Overwrite` is MCU-aligned and zeroed on its own. `DeleteFull`
 /// still wipes the whole image. Do **not** AABB-union overwrites first
-/// (that fills the gap between Drive marks).
+/// (that fills the gap between disjoint marks).
 pub fn burn_image_wipes(
     image: &PdfImage,
     wipes: impl IntoIterator<Item = ImageRedaction>,
@@ -286,7 +258,7 @@ pub fn burn_image_wipes(
 }
 
 /// New Image XObject: `/DCTDecode`, BPC 8, DeviceRGB/Gray, no predictor parms.
-pub fn burned_xobject(burned: &BurnedJpeg) -> Object {
+pub fn burned_xobject(burned: BurnedJpeg) -> Object {
     let mut dict = HashMap::new();
     dict.insert("Type".to_string(), Object::Name("XObject".to_string()));
     dict.insert("Subtype".to_string(), Object::Name("Image".to_string()));
@@ -308,7 +280,7 @@ pub fn burned_xobject(burned: &BurnedJpeg) -> Object {
     dict.insert("Length".to_string(), Object::Integer(burned.data.len() as i64));
     Object::Stream {
         dict,
-        data: bytes::Bytes::from(burned.data.clone()),
+        data: bytes::Bytes::from(burned.data),
     }
 }
 
@@ -397,6 +369,18 @@ mod tests {
         let mut cmyk = dict_with(&[("Filter", Object::Name("DCTDecode".to_string()))]);
         cmyk.insert("ColorSpace".to_string(), Object::Name("DeviceCMYK".to_string()));
         assert!(assert_image_burnable(&cmyk).is_err());
+
+        let mixed = dict_with(&[(
+            "Filter",
+            Object::Array(vec![
+                Object::Name("FlateDecode".to_string()),
+                Object::Integer(123),
+            ]),
+        )]);
+        assert!(
+            assert_image_burnable(&mixed).is_err(),
+            "non-name Filter array element must fail closed"
+        );
     }
 
     #[test]
@@ -435,7 +419,7 @@ mod tests {
     fn mcu_pad_destroys_full_8x8_block() {
         let mut pixels = fill_rgb(16, 16, 0, 255, 0);
         // Distinct secret at decoder (1,1) — not MCU-aligned.
-        let i = (1 * 16 + 1) * 3;
+        let i = (16 + 1) * 3;
         pixels[i] = 255;
         pixels[i + 1] = 0;
         pixels[i + 2] = 255;
@@ -505,13 +489,14 @@ mod tests {
         let img = rgb_image(16, 16, fill_rgb(16, 16, 10, 20, 30));
         let burned = burn_image(&img, ImageRedaction::DeleteFull).unwrap();
         assert!(!burned.gray);
-        let obj = burned_xobject(&burned);
+        let jpeg = burned.data.clone();
+        let obj = burned_xobject(burned);
         let dict = obj.as_dict().unwrap();
         assert_eq!(dict.get("Filter").and_then(Object::as_name), Some("DCTDecode"));
         assert_eq!(dict.get("ColorSpace").and_then(Object::as_name), Some("DeviceRGB"));
         assert_eq!(dict.get("BitsPerComponent").and_then(Object::as_integer), Some(8));
         assert!(!dict.contains_key("DecodeParms"));
-        let out = decode_jpeg_rgb(&burned.data);
+        let out = decode_jpeg_rgb(&jpeg);
         let p = out.get_pixel(4, 4).0;
         assert!(p[0] < 40 && p[1] < 40 && p[2] < 40, "full wipe, got {p:?}");
     }

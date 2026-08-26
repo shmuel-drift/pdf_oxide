@@ -9,12 +9,12 @@
 //! the CTM, ISO §8.9.5).
 //!
 //! This module is the *pure planning primitive*: affine inversion plus a
-//! Keep / DeleteFull / Overwrite-fraction decision. It performs no decode
-//! or re-encode (that integration is a later increment) and is not wired
-//! into any redaction decision, so it cannot itself under-redact. Result
-//! fractions are in the image's normalized `[0,1]²` space; the decode
-//! step applies the correct row orientation to actual pixels. Reuses
-//! `classify`/`region`/`Matrix` (DRY); pure deterministic math.
+//! Keep / DeleteFull / Overwrite-fraction decision. Pixel burn consumes
+//! [`classify_image_wipes`] (one hole per user rectangle).
+//! [`classify_image_placement`] is the legacy AABB-union helper for
+//! intersection-only checks (inline `BI`, unknown XObject subtype).
+//! Result fractions are in the image's normalized `[0,1]²` space; the
+//! decode step applies the correct row orientation to actual pixels.
 
 use super::classify::{classify, transform_bbox, Classification};
 use super::region::RegionSet;
@@ -118,7 +118,7 @@ fn overwrite_from_padded(inv: &Matrix, padded: &Rect) -> ImageRedaction {
     }
 }
 
-/// Per-region wipes for one image placement (Drive multi-select).
+/// Per-region wipes for one image placement (multi-select boxes).
 ///
 /// Empty → `Keep`. A `DeleteFull` entry means the whole image must be
 /// destroyed. Otherwise each `Overwrite` is one user rectangle, **not**
@@ -166,7 +166,7 @@ pub fn classify_image_wipes(
 ///   destroy rather than risk leaving recoverable pixels).
 /// - `Overwrite`  — **AABB union** of intersecting regions (legacy single
 ///   rect). Pixel burn MUST use [`classify_image_wipes`] instead so
-///   disjoint Drive marks do not fill the gap between them.
+///   disjoint marks do not fill the gap between them.
 pub fn classify_image_placement(
     image_ctm: &Matrix,
     regions: &RegionSet,

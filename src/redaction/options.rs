@@ -87,7 +87,9 @@ pub struct RedactionReport {
     pub glyphs_removed: usize,
     /// Images whose covered pixels were overwritten and re-encoded.
     pub images_modified: usize,
-    /// Images deleted entirely (fully covered).
+    /// Images deleted entirely (fully covered). Destructive JPEG/Flate
+    /// burn does **not** increment this: `DeleteFull` zeros pixels and
+    /// keeps the `Do` operator (`images_modified` counts those instead).
     pub images_removed: usize,
     /// Path subpaths dropped or geometry-clipped.
     pub paths_pruned: usize,

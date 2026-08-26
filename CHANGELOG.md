@@ -13,11 +13,13 @@ All notable changes to PDFOxide are documented here.
 - **`ApplyRedactions` burns `/DCTDecode` and `/FlateDecode` image XObjects**
   (including Flate+DCT chains) under each redaction rectangle, re-encodes as
   JPEG (q95, 8-bit DeviceRGB/Gray), and keeps one MCU-padded hole per user
-  rectangle so disjoint Drive marks are not merged into one bounding box.
+  rectangle so disjoint marks are not merged into one bounding box.
   Shared placements are cloned; only the intersecting `Do` is rebound. Form
   XObjects are walked (`/Matrix` × parent CTM). Unused pre-burn image streams
   and replaced page `/Resources` dicts are G6-dropped so the original JPEG
-  cannot survive as an unreferenced object. Intersecting unburnable filters
+  cannot survive as an unreferenced object. When every `Do` of a shared name
+  is burned, the original XObject **name** is dropped from `/Resources` as
+  well (not only the stream id). Intersecting unburnable filters
   (`/JBIG2Decode`, `/JPXDecode`, `/CCITTFaxDecode`, `/SMask`, `/ImageMask`,
   CMYK, inline `BI`) fail the apply with no output. Pages with regions drop
   `/Thumb` and `/Alternates`. (tests: `test_redaction_image_burn`)

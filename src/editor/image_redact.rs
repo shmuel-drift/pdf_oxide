@@ -17,11 +17,34 @@ use crate::redaction::image_prune::{
 use crate::redaction::image_walk::{form_matrix_from_dict, walk_stream_images, DoPlacement};
 use crate::redaction::region::RegionSet;
 use crate::redaction::serialize::serialize_operator;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// Per-stream `/Resources/XObject` edits: insert/replace names, then drop
+/// unused originals. Drop-then-insert so a same-name rebind is not deleted.
+#[derive(Debug, Clone, Default)]
+pub(super) struct XObjectPatch {
+    pub rebinds: HashMap<String, ObjectRef>,
+    pub drop_names: HashSet<String>,
+}
+
+impl XObjectPatch {
+    pub(super) fn is_empty(&self) -> bool {
+        self.rebinds.is_empty() && self.drop_names.is_empty()
+    }
+
+    fn apply_to(&self, xo: &mut HashMap<String, Object>) {
+        for name in &self.drop_names {
+            xo.remove(name);
+        }
+        for (n, r) in &self.rebinds {
+            xo.insert(n.clone(), Object::Reference(*r));
+        }
+    }
+}
 
 pub(super) struct BurnStreamResult {
     pub ops: Vec<Operator>,
-    pub xobject_rebinds: HashMap<String, ObjectRef>,
+    pub xobject_patch: XObjectPatch,
     pub images_modified: usize,
     pub xobjects_specialized: usize,
     pub replaced_ids: HashSet<u32>,
@@ -136,6 +159,25 @@ impl DocumentEditor {
             .unwrap_or("")
     }
 
+    /// Drop the original resource name only when every placement was cloned
+    /// onto a new name (`len != 1`). The single-placement path rebinds the
+    /// same name instead.
+    fn drop_original_if_all_cloned(
+        patch: &mut XObjectPatch,
+        replaced_ids: &mut HashSet<u32>,
+        name: &str,
+        obj_ref: Option<ObjectRef>,
+        affected_len: usize,
+        placements_len: usize,
+    ) {
+        if affected_len == placements_len && placements_len != 1 {
+            patch.drop_names.insert(name.to_string());
+            if let Some(r) = obj_ref {
+                replaced_ids.insert(r.id);
+            }
+        }
+    }
+
     pub(super) fn burn_stream(
         &mut self,
         ops: Vec<Operator>,
@@ -157,7 +199,7 @@ impl DocumentEditor {
         }
 
         let mut ops = ops;
-        let mut xobject_rebinds: HashMap<String, ObjectRef> = HashMap::new();
+        let mut xobject_patch = XObjectPatch::default();
         let mut images_modified = 0usize;
         let mut xobjects_specialized = 0usize;
         let mut replaced_ids: HashSet<u32> = HashSet::new();
@@ -165,8 +207,7 @@ impl DocumentEditor {
         let mut used_names: HashSet<String> =
             self.xobject_entries(resources)?.keys().cloned().collect();
 
-        // Group Do placements by resource name.
-        let mut by_name: HashMap<String, Vec<DoPlacement>> = HashMap::new();
+        let mut by_name: BTreeMap<String, Vec<DoPlacement>> = BTreeMap::new();
         for d in walk.dos {
             by_name.entry(d.name.clone()).or_default().push(d);
         }
@@ -179,8 +220,8 @@ impl DocumentEditor {
                         .as_dict()
                         .ok_or_else(|| Error::InvalidPdf("Form is not a stream".to_string()))?;
                     let form_matrix = form_matrix_from_dict(form_dict);
-                    let form_res = if form_dict.get("Resources").is_some() {
-                        self.as_dict_resolved(form_dict.get("Resources").unwrap())?
+                    let form_res = if let Some(res_obj) = form_dict.get("Resources") {
+                        self.as_dict_resolved(res_obj)?
                     } else {
                         resources.clone()
                     };
@@ -218,7 +259,7 @@ impl DocumentEditor {
                         .filter(|(_, inner)| {
                             inner.images_modified > 0
                                 || inner.xobjects_specialized > 0
-                                || !inner.xobject_rebinds.is_empty()
+                                || !inner.xobject_patch.is_empty()
                         })
                         .collect();
                     if affected.is_empty() {
@@ -227,7 +268,9 @@ impl DocumentEditor {
 
                     let all_affected = affected.len() == placements.len();
                     if all_affected && placements.len() == 1 {
-                        let (p, inner) = affected.into_iter().next().unwrap();
+                        let Some((p, inner)) = affected.into_iter().next() else {
+                            continue;
+                        };
                         let cloned = self.clone_form_with_inner(&obj, &form_res, inner)?;
                         images_modified += cloned.images_modified;
                         xobjects_specialized += cloned.xobjects_specialized + 1;
@@ -237,10 +280,11 @@ impl DocumentEditor {
                         }
                         let new_id = self.allocate_object_id();
                         self.insert_modified(new_id, cloned.form);
-                        let new_ref = ObjectRef::new(new_id, 0);
-                        xobject_rebinds.insert(p.name, new_ref);
-                        let _ = p;
+                        xobject_patch
+                            .rebinds
+                            .insert(p.name, ObjectRef::new(new_id, 0));
                     } else {
+                        let affected_len = affected.len();
                         for (p, inner) in affected {
                             let cloned = self.clone_form_with_inner(&obj, &form_res, inner)?;
                             images_modified += cloned.images_modified;
@@ -251,11 +295,19 @@ impl DocumentEditor {
                             let new_ref = ObjectRef::new(new_id, 0);
                             let new_name = Self::unique_xobject_name(&name, &used_names);
                             used_names.insert(new_name.clone());
-                            xobject_rebinds.insert(new_name.clone(), new_ref);
+                            xobject_patch.rebinds.insert(new_name.clone(), new_ref);
                             if let Operator::Do { name: n } = &mut ops[p.index] {
                                 *n = new_name;
                             }
                         }
+                        Self::drop_original_if_all_cloned(
+                            &mut xobject_patch,
+                            &mut replaced_ids,
+                            &name,
+                            obj_ref,
+                            affected_len,
+                            placements.len(),
+                        );
                     }
                 },
                 "Image" => {
@@ -287,30 +339,45 @@ impl DocumentEditor {
                     // One placement: rebind the original name. Several: clone
                     // each so wipe sets do not merge into one JPEG.
                     if placements.len() == 1 {
-                        let (_p, wipes) = affected.into_iter().next().unwrap();
+                        let Some((_p, wipes)) = affected.into_iter().next() else {
+                            continue;
+                        };
                         let burned = burn_image_wipes(&extracted, wipes)?;
                         let new_id = self.allocate_object_id();
-                        self.insert_modified(new_id, burned_xobject(&burned));
-                        xobject_rebinds.insert(name, ObjectRef::new(new_id, 0));
+                        self.insert_modified(new_id, burned_xobject(burned));
+                        xobject_patch
+                            .rebinds
+                            .insert(name, ObjectRef::new(new_id, 0));
                         if let Some(r) = obj_ref {
                             replaced_ids.insert(r.id);
                         }
                         images_modified += 1;
                         xobjects_specialized += 1;
                     } else {
+                        let affected_len = affected.len();
                         for (p, wipes) in affected {
                             let burned = burn_image_wipes(&extracted, wipes)?;
                             let new_id = self.allocate_object_id();
-                            self.insert_modified(new_id, burned_xobject(&burned));
+                            self.insert_modified(new_id, burned_xobject(burned));
                             let new_name = Self::unique_xobject_name(&name, &used_names);
                             used_names.insert(new_name.clone());
-                            xobject_rebinds.insert(new_name.clone(), ObjectRef::new(new_id, 0));
+                            xobject_patch
+                                .rebinds
+                                .insert(new_name.clone(), ObjectRef::new(new_id, 0));
                             if let Operator::Do { name: n } = &mut ops[p.index] {
                                 *n = new_name;
                             }
                             images_modified += 1;
                             xobjects_specialized += 1;
                         }
+                        Self::drop_original_if_all_cloned(
+                            &mut xobject_patch,
+                            &mut replaced_ids,
+                            &name,
+                            obj_ref,
+                            affected_len,
+                            placements.len(),
+                        );
                     }
                 },
                 other => {
@@ -328,7 +395,7 @@ impl DocumentEditor {
 
         Ok(BurnStreamResult {
             ops,
-            xobject_rebinds,
+            xobject_patch,
             images_modified,
             xobjects_specialized,
             replaced_ids,
@@ -349,18 +416,16 @@ impl DocumentEditor {
             .as_dict()
             .cloned()
             .ok_or_else(|| Error::InvalidPdf("Form is not a stream".to_string()))?;
-        let mut res = if dict.get("Resources").is_some() {
-            self.as_dict_resolved(dict.get("Resources").unwrap())?
+        let mut res = if let Some(res_obj) = dict.get("Resources") {
+            self.as_dict_resolved(res_obj)?
         } else {
             parent_or_form_res.clone()
         };
         let mut xo = match res.get("XObject") {
-            Some(x) => self.as_dict_resolved(x).unwrap_or_default(),
+            Some(x) => self.as_dict_resolved(x)?,
             None => HashMap::new(),
         };
-        for (n, r) in &inner.xobject_rebinds {
-            xo.insert(n.clone(), Object::Reference(*r));
-        }
+        inner.xobject_patch.apply_to(&mut xo);
         res.insert("XObject".to_string(), Object::Dictionary(xo));
         dict.insert("Resources".to_string(), Object::Dictionary(res));
         dict.remove("Filter");
@@ -410,11 +475,9 @@ impl DocumentEditor {
 
     fn page_resources_with_rebinds(&self, page: usize) -> Result<HashMap<String, Object>> {
         let mut res = self.resolve_page_resources(page)?;
-        if let Some(rebinds) = self.redacted_xobject_rebinds.get(&page) {
-            let mut xo = self.xobject_entries(&res).unwrap_or_default();
-            for (n, r) in rebinds {
-                xo.insert(n.clone(), Object::Reference(*r));
-            }
+        if let Some(patch) = self.redacted_xobject_rebinds.get(&page) {
+            let mut xo = self.xobject_entries(&res)?;
+            patch.apply_to(&mut xo);
             res.insert("XObject".to_string(), Object::Dictionary(xo));
         }
         Ok(res)
@@ -463,8 +526,8 @@ impl DocumentEditor {
     }
 
     /// Save inlines rebound `/Resources` on image-burn pages. The old
-    /// Resources dictionary still names the pre-burn image id (Intune
-    /// object 8 → `/Image1 4 0 R`) and must not be emitted if no other
+    /// Resources dictionary still names the pre-burn image id (indirect
+    /// `/Resources` → `/Im1 <id> 0 R`) and must not be emitted if no other
     /// page still points at it.
     fn g6_unused_inlined_resource_dicts(&mut self) {
         let n = self.original_page_count;
@@ -509,10 +572,10 @@ impl DocumentEditor {
             page_dict.remove("Thumb");
             page_dict.remove("Alternates");
         }
-        let Some(rebinds) = self.redacted_xobject_rebinds.get(&page_index) else {
+        let Some(patch) = self.redacted_xobject_rebinds.get(&page_index) else {
             return Ok(());
         };
-        if rebinds.is_empty() {
+        if patch.is_empty() {
             return Ok(());
         }
         let mut res = if let Some(existing) = page_dict.get("Resources") {
@@ -520,10 +583,8 @@ impl DocumentEditor {
         } else {
             self.resolve_page_resources(page_index)?
         };
-        let mut xo = self.xobject_entries(&res).unwrap_or_default();
-        for (name, r) in rebinds {
-            xo.insert(name.clone(), Object::Reference(*r));
-        }
+        let mut xo = self.xobject_entries(&res)?;
+        patch.apply_to(&mut xo);
         res.insert("XObject".to_string(), Object::Dictionary(xo));
         page_dict.insert("Resources".to_string(), Object::Dictionary(res));
         Ok(())
