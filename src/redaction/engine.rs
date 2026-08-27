@@ -161,7 +161,14 @@ pub fn redact_content_stream(
         ));
     }
 
-    refuse_intersecting_unburnable(&ops, Matrix::identity(), regions, opts.edge_padding, None)?;
+    refuse_intersecting_unburnable(
+        &ops,
+        Matrix::identity(),
+        regions,
+        opts.edge_padding,
+        None,
+        None,
+    )?;
 
     let mut body = Vec::with_capacity(content.len());
     for op in &te.operators {

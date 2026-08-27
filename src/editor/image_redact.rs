@@ -120,8 +120,9 @@ impl DocumentEditor {
             .and_then(|o| self.as_dict_resolved(o).ok())
     }
 
-    /// `/Shading` resource name → `/BBox` when present. Missing bbox means
-    /// `path_walk` cannot prove the shading is outside a region.
+    /// `/Shading` resource name → `/BBox` when present and the dict has no
+    /// `/Matrix`. Missing bbox or a `/Matrix` means `path_walk` cannot prove
+    /// the shading is outside a region.
     fn shading_bboxes(&self, resources: &HashMap<String, Object>) -> HashMap<String, Rect> {
         let mut out = HashMap::new();
         let Some(sh_obj) = resources.get("Shading") else {
@@ -134,6 +135,9 @@ impl DocumentEditor {
             let Ok(dict) = self.as_dict_resolved(&val) else {
                 continue;
             };
+            if dict.contains_key("Matrix") {
+                continue;
+            }
             let Some(Object::Array(arr)) = dict.get("BBox") else {
                 continue;
             };
@@ -151,6 +155,34 @@ impl DocumentEditor {
                 continue;
             };
             out.insert(name, Rect::from_points(x0, y0, x1, y1).normalize());
+        }
+        out
+    }
+
+    /// `/ExtGState` name → `/LW` when present. Resolved dicts without `/LW`
+    /// map to `None` (alpha-only `gs` is not a stroke-width hole). Names
+    /// omitted from the map are unresolvable and fail closed.
+    fn ext_gstate_line_widths(
+        &self,
+        resources: &HashMap<String, Object>,
+    ) -> HashMap<String, Option<f32>> {
+        let mut out = HashMap::new();
+        let Some(gs_obj) = resources.get("ExtGState") else {
+            return out;
+        };
+        let Ok(gs) = self.as_dict_resolved(gs_obj) else {
+            return out;
+        };
+        for (name, val) in gs {
+            let Ok(dict) = self.as_dict_resolved(&val) else {
+                continue;
+            };
+            let lw = dict.get("LW").and_then(|o| {
+                o.as_integer()
+                    .map(|i| i as f32)
+                    .or_else(|| o.as_real().map(|r| r as f32))
+            });
+            out.insert(name, lw);
         }
         out
     }
@@ -231,7 +263,15 @@ impl DocumentEditor {
             )));
         }
         let shading = self.shading_bboxes(resources);
-        refuse_intersecting_unburnable(&ops, initial_ctm, regions, padding, Some(&shading))?;
+        let gs_lw = self.ext_gstate_line_widths(resources);
+        refuse_intersecting_unburnable(
+            &ops,
+            initial_ctm,
+            regions,
+            padding,
+            Some(&shading),
+            Some(&gs_lw),
+        )?;
         let walk = walk_stream_images(&ops, initial_ctm, regions, padding);
         if walk.intersecting_inline {
             return Err(Error::Unsupported("redaction cannot burn inline (BI) images".to_string()));

@@ -107,8 +107,10 @@ fn destructive_redaction_removes_secret_text_and_bytes() {
     );
 }
 
-/// Re-redacting an already-redacted document is a no-op and never panics
-/// (G8 idempotence at the document level).
+/// Re-opening a redacted document must not resurrect the secret (G8).
+/// A second apply over the same area fail-closes: the first pass appended
+/// an overlay `re f`, which is intersecting vector paint until `path_prune`
+/// exists.
 #[test]
 fn destructive_redaction_is_idempotent() {
     let src = build_secret_pdf();
@@ -118,17 +120,15 @@ fn destructive_redaction_is_idempotent() {
     ed.apply_redactions_destructive(RedactionOptions::default())
         .expect("first pass");
     let once = ed.save_to_bytes().expect("save once");
+    assert!(!page0_text(&once).contains(SECRET), "secret reappeared after save");
 
     let mut ed2 = DocumentEditor::from_bytes(once).expect("reopen");
     ed2.add_redaction(0, [0.0, 0.0, 5000.0, 5000.0], None)
         .unwrap();
-    // Second pass over already-clean content: must not error or panic.
-    let _ = ed2
+    let err = ed2
         .apply_redactions_destructive(RedactionOptions::default())
-        .expect("second pass is safe");
-    let twice = ed2.save_to_bytes().expect("save twice");
-
-    assert!(!page0_text(&twice).contains(SECRET), "secret reappeared after re-redaction");
+        .expect_err("overlay fill is unburnable vector paint");
+    assert!(err.to_string().contains("vector path"), "{err}");
 }
 
 /// `redaction_count` reflects queued programmatic regions.

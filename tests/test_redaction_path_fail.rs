@@ -165,3 +165,85 @@ fn shading_without_bbox_fails() {
         .expect_err("shading must fail");
     assert!(err.to_string().contains("shading"), "{err}");
 }
+
+#[test]
+fn close_and_stroke_s_fails_no_mutation() {
+    let contents = b"10 10 m 40 10 l 40 40 l s";
+    let src = page_pdf("[0 0 100 100]", contents, &[], "");
+    let mut ed = DocumentEditor::from_bytes(src.clone()).unwrap();
+    ed.add_redaction(0, [0.0, 0.0, 50.0, 50.0], None).unwrap();
+    let err = ed
+        .apply_redactions_destructive(RedactionOptions::default())
+        .expect_err("s under box must fail");
+    assert!(err.to_string().contains("vector path"), "{err}");
+    let out = save_raw(&mut ed);
+    assert!(
+        out.windows(contents.len())
+            .any(|w| w == contents.as_slice()),
+        "failed apply must leave original s-path bytes"
+    );
+}
+
+#[test]
+fn gs_lw_fat_stroke_fails() {
+    let contents = b"/GS1 gs 0.5 0 0 0.5 0 0 cm 0 110 m 20 110 l S";
+    let src = page_pdf("[0 0 100 100]", contents, &[], "/ExtGState << /GS1 << /LW 20 >> >>");
+    let mut ed = DocumentEditor::from_bytes(src).unwrap();
+    ed.add_redaction(0, [0.0, 0.0, 50.0, 50.0], None).unwrap();
+    assert!(ed
+        .apply_redactions_destructive(RedactionOptions::default())
+        .is_err());
+}
+
+#[test]
+fn gs_ca_only_path_outside_allows_apply() {
+    let contents = b"/GS1 gs 80 80 m 90 80 l S";
+    let src = page_pdf("[0 0 100 100]", contents, &[], "/ExtGState << /GS1 << /CA 0.5 >> >>");
+    let mut ed = DocumentEditor::from_bytes(src).unwrap();
+    ed.add_redaction(0, [0.0, 0.0, 20.0, 20.0], None).unwrap();
+    ed.apply_redactions_destructive(RedactionOptions::default())
+        .expect("alpha-only gs must not refuse an outside stroke");
+}
+
+#[test]
+fn form_page_scale_form_translate_maps_path() {
+    // Same compose as image-burn: Form /Matrix T(2,1) then page S(32)
+    // maps a unit square onto [64,32]–[96,64]. Swapped order is [2,1]–[34,33].
+    let page_c = b"q 32 0 0 32 0 0 cm /Fm1 Do Q";
+    let form_c = b"0 0 1 1 re f";
+    let form_stream =
+        stream_obj("/Type /XObject /Subtype /Form /BBox [0 0 1 1] /Matrix [1 0 0 1 2 1]", form_c);
+    let src = page_pdf("[0 0 120 80]", page_c, &[form_stream], "/XObject << /Fm1 5 0 R >>");
+
+    let mut ed = DocumentEditor::from_bytes(src.clone()).unwrap();
+    ed.add_redaction(0, [64.0, 32.0, 96.0, 64.0], None).unwrap();
+    assert!(
+        ed.apply_redactions_destructive(RedactionOptions::default())
+            .is_err(),
+        "T then S must map the fill onto [64,32,96,64]"
+    );
+
+    let mut ed_wrong = DocumentEditor::from_bytes(src).unwrap();
+    ed_wrong
+        .add_redaction(0, [2.0, 1.0, 34.0, 33.0], None)
+        .unwrap();
+    ed_wrong
+        .apply_redactions_destructive(RedactionOptions::default())
+        .expect("S then T rect must not hit the fill under this crate's multiply");
+}
+
+#[test]
+fn shading_with_matrix_fails_even_if_bbox_misses() {
+    let shading = b"<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0] \
+         /BBox [200 200 250 250] /Matrix [1 0 0 1 0 0] /Function 6 0 R >>\n"
+        .to_vec();
+    let func = b"<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 0 0] /N 1 >>\n".to_vec();
+    let contents = b"/Sh1 sh";
+    let src = page_pdf("[0 0 100 100]", contents, &[shading, func], "/Shading << /Sh1 5 0 R >>");
+    let mut ed = DocumentEditor::from_bytes(src).unwrap();
+    ed.add_redaction(0, [0.0, 0.0, 50.0, 50.0], None).unwrap();
+    let err = ed
+        .apply_redactions_destructive(RedactionOptions::default())
+        .expect_err("shading /Matrix is unprovable");
+    assert!(err.to_string().contains("shading"), "{err}");
+}

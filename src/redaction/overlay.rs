@@ -90,12 +90,7 @@ pub fn region_in_stream_space(region: &RedactionRegion, ctm: &Matrix) -> Redacti
         return RedactionRegion::from_quad(out, region.fill);
     }
 
-    let page = Rect::from_points(
-        region.bbox[0],
-        region.bbox[1],
-        region.bbox[2],
-        region.bbox[3],
-    );
+    let page = Rect::from_points(region.bbox[0], region.bbox[1], region.bbox[2], region.bbox[3]);
     let local = transform_bbox(&page, &inv);
     RedactionRegion::from_rect(
         local.left(),

@@ -25,6 +25,8 @@ pub enum UnburnableMark {
     /// `sh` shading whose bbox intersects, or whose bbox cannot be proved
     /// outside the region.
     Shading,
+    /// `gs` whose ExtGState dict was not in the resource map (unknown `/LW`).
+    ExtGState,
 }
 
 impl UnburnableMark {
@@ -38,6 +40,11 @@ impl UnburnableMark {
             ),
             UnburnableMark::Shading => Error::Unsupported(
                 "destructive redaction cannot destroy intersecting shadings (sh); \
+                 refusing rather than overlay-only"
+                    .to_string(),
+            ),
+            UnburnableMark::ExtGState => Error::Unsupported(
+                "destructive redaction cannot resolve ExtGState (gs); \
                  refusing rather than overlay-only"
                     .to_string(),
             ),
@@ -122,12 +129,17 @@ fn path_hits(
 /// `shading_bbox` maps resource names to a local-space `/BBox` when known.
 /// A `sh` whose name is missing from the map, or whose bbox intersects,
 /// is unburnable. Omit the map (`None`) to refuse every `sh`.
+///
+/// `gs_lw` maps ExtGState names to `/LW` (`Some`) or a resolved dict with
+/// no `/LW` (`None`). Omit (`None`) to ignore `gs`. A name missing from
+/// `Some(map)` is unresolvable and fails closed.
 pub fn intersecting_unburnable(
     ops: &[Operator],
     initial_ctm: Matrix,
     regions: &RegionSet,
     padding: f32,
     shading_bbox: Option<&HashMap<String, Rect>>,
+    gs_lw: Option<&HashMap<String, Option<f32>>>,
 ) -> Option<UnburnableMark> {
     if regions.is_empty() {
         return None;
@@ -149,6 +161,15 @@ pub fn intersecting_unburnable(
             },
             Operator::SetLineWidth { width } => {
                 stack.current_mut().line_width = *width;
+            },
+            Operator::SetExtGState { dict_name } => {
+                if let Some(map) = gs_lw {
+                    match map.get(dict_name) {
+                        Some(Some(w)) => stack.current_mut().line_width = *w,
+                        Some(None) => {},
+                        None => return Some(UnburnableMark::ExtGState),
+                    }
+                }
             },
             Operator::MoveTo { x, y } => path.add(Point::new(*x, *y), &ctm),
             Operator::LineTo { x, y } => path.add(Point::new(*x, *y), &ctm),
@@ -190,6 +211,13 @@ pub fn intersecting_unburnable(
             },
             Operator::ClosePath => {},
             Operator::Stroke => {
+                if path_hits(&path, &stack.current().ctm, regions, padding, stroke_pad_page(&stack))
+                {
+                    return Some(UnburnableMark::Path);
+                }
+                path.clear();
+            },
+            Operator::Other { name, .. } if name == "s" => {
                 if path_hits(&path, &stack.current().ctm, regions, padding, stroke_pad_page(&stack))
                 {
                     return Some(UnburnableMark::Path);
@@ -243,8 +271,9 @@ pub fn refuse_intersecting_unburnable(
     regions: &RegionSet,
     padding: f32,
     shading_bbox: Option<&HashMap<String, Rect>>,
+    gs_lw: Option<&HashMap<String, Option<f32>>>,
 ) -> Result<()> {
-    match intersecting_unburnable(ops, initial_ctm, regions, padding, shading_bbox) {
+    match intersecting_unburnable(ops, initial_ctm, regions, padding, shading_bbox, gs_lw) {
         Some(mark) => Err(mark.into_error()),
         None => Ok(()),
     }
@@ -271,6 +300,7 @@ mod tests {
                 Matrix::identity(),
                 &box_origin(),
                 DEFAULT_EDGE_PADDING,
+                None,
                 None
             ),
             Some(UnburnableMark::Path)
@@ -286,6 +316,7 @@ mod tests {
                 Matrix::identity(),
                 &box_origin(),
                 DEFAULT_EDGE_PADDING,
+                None,
                 None
             ),
             None
@@ -301,6 +332,7 @@ mod tests {
                 Matrix::identity(),
                 &box_origin(),
                 DEFAULT_EDGE_PADDING,
+                None,
                 None
             ),
             Some(UnburnableMark::Path)
@@ -316,6 +348,7 @@ mod tests {
                 Matrix::identity(),
                 &box_origin(),
                 DEFAULT_EDGE_PADDING,
+                None,
                 None
             ),
             None
@@ -331,6 +364,7 @@ mod tests {
                 Matrix::identity(),
                 &box_origin(),
                 DEFAULT_EDGE_PADDING,
+                None,
                 None
             ),
             Some(UnburnableMark::Shading)
@@ -348,7 +382,8 @@ mod tests {
                 Matrix::identity(),
                 &box_origin(),
                 DEFAULT_EDGE_PADDING,
-                Some(&map)
+                Some(&map),
+                None
             ),
             None
         );
@@ -360,7 +395,14 @@ mod tests {
         let mut rs = RegionSet::new(0);
         rs.push(RedactionRegion::from_rect(200.0, 0.0, 250.0, 50.0, None));
         assert_eq!(
-            intersecting_unburnable(&ops, Matrix::identity(), &rs, DEFAULT_EDGE_PADDING, None),
+            intersecting_unburnable(
+                &ops,
+                Matrix::identity(),
+                &rs,
+                DEFAULT_EDGE_PADDING,
+                None,
+                None
+            ),
             Some(UnburnableMark::Path)
         );
     }
@@ -374,6 +416,7 @@ mod tests {
                 Matrix::identity(),
                 &box_origin(),
                 DEFAULT_EDGE_PADDING,
+                None,
                 None
             ),
             Some(UnburnableMark::Path)
@@ -391,6 +434,7 @@ mod tests {
                 Matrix::identity(),
                 &box_origin(),
                 DEFAULT_EDGE_PADDING,
+                None,
                 None
             ),
             Some(UnburnableMark::Path)
@@ -408,9 +452,61 @@ mod tests {
                 Matrix::identity(),
                 &box_origin(),
                 DEFAULT_EDGE_PADDING,
+                None,
                 None
             ),
             Some(UnburnableMark::Path)
+        );
+    }
+
+    #[test]
+    fn close_and_stroke_s_in_region_is_unburnable() {
+        let ops = parse_content_stream(b"10 10 m 40 10 l 40 40 l s").unwrap();
+        assert_eq!(
+            intersecting_unburnable(
+                &ops,
+                Matrix::identity(),
+                &box_origin(),
+                DEFAULT_EDGE_PADDING,
+                None,
+                None
+            ),
+            Some(UnburnableMark::Path)
+        );
+    }
+
+    #[test]
+    fn gs_lw_fat_stroke_is_unburnable() {
+        let ops = parse_content_stream(b"/GS1 gs 0.5 0 0 0.5 0 0 cm 0 110 m 20 110 l S").unwrap();
+        let mut gs = HashMap::new();
+        gs.insert("GS1".to_string(), Some(20.0));
+        assert_eq!(
+            intersecting_unburnable(
+                &ops,
+                Matrix::identity(),
+                &box_origin(),
+                DEFAULT_EDGE_PADDING,
+                None,
+                Some(&gs)
+            ),
+            Some(UnburnableMark::Path)
+        );
+    }
+
+    #[test]
+    fn unresolved_gs_is_unburnable() {
+        let ops = parse_content_stream(b"/GS1 gs 80 80 m 90 80 l S").unwrap();
+        let gs: HashMap<String, Option<f32>> = HashMap::new();
+        assert_eq!(
+            intersecting_unburnable(
+                &ops,
+                Matrix::identity(),
+                &box_origin(),
+                DEFAULT_EDGE_PADDING,
+                None,
+                Some(&gs)
+            ),
+            Some(UnburnableMark::ExtGState)
         );
     }
 }

@@ -26,11 +26,14 @@ All notable changes to PDFOxide are documented here.
   `/Thumb` and `/Alternates`. (tests: `test_redaction_image_burn`)
 - **Intersecting vector paint fails closed.** Charts, strokes, and fills
   under a box are not destroyed (`path_prune` is still unwired). Apply
-  refuses rather than painting an overlay over extractable `m`/`l`/`re`/`S`/`f`.
-  Page clip-and-discard (`re W n`) is not treated as a drawing; clip-and-paint
-  (`re W f`) still refuses. `sh` shadings fail unless a `/BBox` proves they miss
-  every region. Form XObjects are scanned with the composed CTM.
-  (tests: `test_redaction_path_fail`)
+  refuses rather than painting an overlay over extractable `m`/`l`/`re`/`S`/`f`
+  (`s` close-and-stroke included). Page clip-and-discard (`re W n`) is not
+  treated as a drawing; clip-and-paint (`re W f`) still refuses. `gs` applies
+  `/LW` when the ExtGState dict resolves; unresolved `gs` refuses. `sh`
+  shadings fail unless a `/BBox` proves they miss every region (a shading
+  `/Matrix` is treated as unprovable). Form XObjects are scanned with the
+  composed CTM. Re-apply over an existing overlay fill fail-closes for the
+  same reason. (tests: `test_redaction_path_fail`, `test_redaction_destructive`)
 
 ## [0.3.78-fork.1] - 2026-08-06
 
