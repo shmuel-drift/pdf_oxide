@@ -27,9 +27,11 @@
 
 use super::options::{RedactionOptions, RedactionReport};
 use super::overlay::{region_in_stream_space, region_overlay_ops};
+use super::path_walk::refuse_intersecting_unburnable;
 use super::region::RegionSet;
 use super::serialize::serialize_operator;
 use super::text_engine::{redact_text_stream, FontMetrics};
+use crate::content::graphics_state::Matrix;
 use crate::content::parser::parse_content_stream;
 use crate::error::{Error, Result};
 use crate::fonts::{Encoding, FontInfo};
@@ -139,6 +141,8 @@ impl FontMetrics for FontInfoMetrics {
 /// - [`Error::Unsupported`] — a text show used a composite/Type0/unknown
 ///   font while regions exist; redaction is **refused** rather than risk
 ///   a silent under-redaction (feature plan §9 risk 6, fail closed).
+///   Intersecting vector paint or `sh` is refused the same way (paths are
+///   not destroyed).
 /// - [`Error::ParseError`] — the content stream did not parse.
 pub fn redact_content_stream(
     content: &[u8],
@@ -156,6 +160,8 @@ pub fn redact_content_stream(
                 .to_string(),
         ));
     }
+
+    refuse_intersecting_unburnable(&ops, Matrix::identity(), regions, opts.edge_padding, None)?;
 
     let mut body = Vec::with_capacity(content.len());
     for op in &te.operators {
@@ -282,6 +288,32 @@ mod tests {
     }
 
     #[test]
+    fn intersecting_vector_path_is_refused() {
+        let doc = b"10 10 m 40 10 l S\nBT\n/F1 10 Tf\n1 0 0 1 100 700 Tm\n(TOPSECRET) Tj\nET\n";
+        let regions = one_region(0.0, 0.0, 50.0, 50.0);
+        let err =
+            redact_content_stream(doc, &regions, &RedactionOptions::default(), &Stub).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "expected path refusal, got {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("vector path"), "{msg}");
+    }
+
+    #[test]
+    fn path_outside_region_does_not_block_text_redaction() {
+        let doc = b"200 200 m 240 200 l S\nBT\n/F1 10 Tf\n1 0 0 1 100 700 Tm\n(TOPSECRET) Tj\nET\n";
+        let regions = one_region(90.0, 695.0, 160.0, 715.0);
+        let (out, report) =
+            redact_content_stream(doc, &regions, &RedactionOptions::default(), &Stub).unwrap();
+        assert_eq!(report.glyphs_removed, 9);
+        assert_absent(&out, b"TOPSECRET");
+        assert!(
+            out.windows(3).any(|w| w == b"200"),
+            "outside stroke must survive: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
     fn no_regions_keeps_content_and_draws_nothing() {
         let (out, report) = redact_content_stream(
             SECRET_DOC,
@@ -348,10 +380,7 @@ ET\n";
             .find(|l| l.ends_with(" re"))
             .unwrap_or_else(|| panic!("no overlay re in: {s}"));
         let parts: Vec<&str> = re_line.split_whitespace().collect();
-        assert!(
-            parts.len() >= 5,
-            "expected 'x y w h re', got: {re_line}"
-        );
+        assert!(parts.len() >= 5, "expected 'x y w h re', got: {re_line}");
         let y: f32 = parts[1].parse().expect("overlay y");
         let h: f32 = parts[3].parse().expect("overlay h");
         assert!(
@@ -359,9 +388,6 @@ ET\n";
             "overlay must be in stream space near local y=680 (got y={y} h={h} from {re_line}); \
              page-space y≈100 would paint at the wrong visual edge under the active Y-flip CTM"
         );
-        assert!(
-            y > 140.0,
-            "must not emit raw page-space y (got {y} from {re_line})"
-        );
+        assert!(y > 140.0, "must not emit raw page-space y (got {y} from {re_line})");
     }
 }

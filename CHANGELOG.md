@@ -6,7 +6,8 @@ All notable changes to PDFOxide are documented here.
 
 > Fork: destructive redaction burns JPEG/Flate image pixels under each redaction
 > rectangle (not overlay-only), then hard-drops unused original streams so
-> extractors cannot recover the secret.
+> extractors cannot recover the secret. Intersecting vector paint and
+> unprovable shadings fail closed instead of overlay-only.
 
 ### Added
 
@@ -23,6 +24,13 @@ All notable changes to PDFOxide are documented here.
   (`/JBIG2Decode`, `/JPXDecode`, `/CCITTFaxDecode`, `/SMask`, `/ImageMask`,
   CMYK, inline `BI`) fail the apply with no output. Pages with regions drop
   `/Thumb` and `/Alternates`. (tests: `test_redaction_image_burn`)
+- **Intersecting vector paint fails closed.** Charts, strokes, and fills
+  under a box are not destroyed (`path_prune` is still unwired). Apply
+  refuses rather than painting an overlay over extractable `m`/`l`/`re`/`S`/`f`.
+  Page clip-and-discard (`re W n`) is not treated as a drawing; clip-and-paint
+  (`re W f`) still refuses. `sh` shadings fail unless a `/BBox` proves they miss
+  every region. Form XObjects are scanned with the composed CTM.
+  (tests: `test_redaction_path_fail`)
 
 ## [0.3.78-fork.1] - 2026-08-06
 

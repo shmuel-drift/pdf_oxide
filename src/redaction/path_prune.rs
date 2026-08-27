@@ -7,11 +7,9 @@
 //!
 //! This module provides the *pure* clipping primitive — Sutherland–
 //! Hodgman of a polygon against an axis-aligned rectangle — plus a
-//! bounding-box helper. It owns no operator-stream logic (SRP); the path
-//! walker that accumulates `m l c v y re h` and reacts to the paint
-//! operators composes these. Pure deterministic geometry with a known
-//! reference algorithm, independently testable, not yet wired into any
-//! redaction decision (so it cannot itself under-redact).
+//! bounding-box helper. It owns no operator-stream logic (SRP). Apply
+//! uses [`super::path_walk`] to **fail closed** on intersecting paint
+//! rather than clipping paths in place (clip-rewrite is still unwired).
 
 use crate::geometry::{Point, Rect};
 
