@@ -547,7 +547,7 @@ fn show_strings(op: &Operator) -> Vec<&[u8]> {
     }
 }
 
-fn merge_region_hits(destination: &mut Vec<bool>, source: &[bool]) {
+pub(crate) fn merge_region_hits(destination: &mut Vec<bool>, source: &[bool]) {
     if destination.len() < source.len() {
         destination.resize(source.len(), false);
     }
