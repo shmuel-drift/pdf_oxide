@@ -7,6 +7,7 @@ use crate::content::graphics_state::Matrix;
 use crate::content::operators::Operator;
 use crate::error::{Error, Result};
 use crate::extractors::extract_image_from_xobject;
+use crate::geometry::Rect;
 use crate::object::{Object, ObjectRef};
 use crate::redaction::image_burn::{
     assert_image_burnable, burn_image_wipes, burned_xobject, MAX_FORM_DEPTH,
@@ -15,6 +16,7 @@ use crate::redaction::image_prune::{
     classify_image_placement, classify_image_wipes, ImageRedaction,
 };
 use crate::redaction::image_walk::{form_matrix_from_dict, walk_stream_images, DoPlacement};
+use crate::redaction::path_walk::refuse_intersecting_unburnable;
 use crate::redaction::region::RegionSet;
 use crate::redaction::serialize::serialize_operator;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -118,6 +120,73 @@ impl DocumentEditor {
             .and_then(|o| self.as_dict_resolved(o).ok())
     }
 
+    /// `/Shading` resource name → `/BBox` when present and the dict has no
+    /// `/Matrix`. Missing bbox or a `/Matrix` means `path_walk` cannot prove
+    /// the shading is outside a region.
+    fn shading_bboxes(&self, resources: &HashMap<String, Object>) -> HashMap<String, Rect> {
+        let mut out = HashMap::new();
+        let Some(sh_obj) = resources.get("Shading") else {
+            return out;
+        };
+        let Ok(sh) = self.as_dict_resolved(sh_obj) else {
+            return out;
+        };
+        for (name, val) in sh {
+            let Ok(dict) = self.as_dict_resolved(&val) else {
+                continue;
+            };
+            if dict.contains_key("Matrix") {
+                continue;
+            }
+            let Some(Object::Array(arr)) = dict.get("BBox") else {
+                continue;
+            };
+            if arr.len() != 4 {
+                continue;
+            }
+            let num = |o: &Object| -> Option<f32> {
+                o.as_integer()
+                    .map(|i| i as f32)
+                    .or_else(|| o.as_real().map(|r| r as f32))
+            };
+            let (Some(x0), Some(y0), Some(x1), Some(y1)) =
+                (num(&arr[0]), num(&arr[1]), num(&arr[2]), num(&arr[3]))
+            else {
+                continue;
+            };
+            out.insert(name, Rect::from_points(x0, y0, x1, y1).normalize());
+        }
+        out
+    }
+
+    /// `/ExtGState` name → `/LW` when present. Resolved dicts without `/LW`
+    /// map to `None` (alpha-only `gs` is not a stroke-width hole). Names
+    /// omitted from the map are unresolvable and fail closed.
+    fn ext_gstate_line_widths(
+        &self,
+        resources: &HashMap<String, Object>,
+    ) -> HashMap<String, Option<f32>> {
+        let mut out = HashMap::new();
+        let Some(gs_obj) = resources.get("ExtGState") else {
+            return out;
+        };
+        let Ok(gs) = self.as_dict_resolved(gs_obj) else {
+            return out;
+        };
+        for (name, val) in gs {
+            let Ok(dict) = self.as_dict_resolved(&val) else {
+                continue;
+            };
+            let lw = dict.get("LW").and_then(|o| {
+                o.as_integer()
+                    .map(|i| i as f32)
+                    .or_else(|| o.as_real().map(|r| r as f32))
+            });
+            out.insert(name, lw);
+        }
+        out
+    }
+
     fn resolve_xobject(
         &self,
         resources: &HashMap<String, Object>,
@@ -193,6 +262,16 @@ impl DocumentEditor {
                 "Form XObject nesting exceeds {MAX_FORM_DEPTH}"
             )));
         }
+        let shading = self.shading_bboxes(resources);
+        let gs_lw = self.ext_gstate_line_widths(resources);
+        refuse_intersecting_unburnable(
+            &ops,
+            initial_ctm,
+            regions,
+            padding,
+            Some(&shading),
+            Some(&gs_lw),
+        )?;
         let walk = walk_stream_images(&ops, initial_ctm, regions, padding);
         if walk.intersecting_inline {
             return Err(Error::Unsupported("redaction cannot burn inline (BI) images".to_string()));

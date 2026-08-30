@@ -7122,10 +7122,11 @@ impl DocumentEditor {
     }
 
     /// Destructively apply every queued redaction (programmatic
-    /// rectangles + source `/Redact` annotations): the underlying text
-    /// is physically removed from the content stream and an opaque
-    /// overlay drawn over the area (ISO 32000-1:2008 §12.5.6.23 — "remove
-    /// all traces"). The redacted pages' content is rewritten so that a
+    /// rectangles + source `/Redact` annotations): intersecting vector
+    /// text is removed, JPEG/Flate pixels are burned, and an opaque
+    /// overlay is drawn. Intersecting vector **paint** and unprovable
+    /// shadings refuse the apply (overlay-only would leave the drawing
+    /// extractable). The redacted pages' content is rewritten so that a
     /// subsequent garbage-collected full-rewrite save (the default
     /// [`save_to_bytes`]/[`save`]) leaves no residual recoverable bytes
     /// (G6); the `/Redact` annotations are removed.
@@ -7138,7 +7139,9 @@ impl DocumentEditor {
     /// # Errors
     /// - [`Error::Unsupported`] if a redacted page shows text in a
     ///   composite/Type0/unknown font (refused rather than risk a silent
-    ///   under-redaction — fail closed).
+    ///   under-redaction — fail closed), or if a vector path / shading
+    ///   intersects a region (overlay-only would leave the drawing
+    ///   extractable).
     /// - [`Error::InvalidPdf`]/[`Error::ParseError`] on an unreadable
     ///   page or content stream.
     pub fn apply_redactions_destructive(
