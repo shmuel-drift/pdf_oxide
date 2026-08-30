@@ -460,14 +460,10 @@ pub fn redact_text_stream(
                             }
                             survived_runs.glyphs_removed += r.glyphs_removed;
                             survived_runs.runs.extend(r.runs);
-                            if survived_runs.region_glyph_hits.len() < r.region_glyph_hits.len() {
-                                survived_runs.region_glyph_hits.resize(r.region_glyph_hits.len(), false);
-                            }
-                            for (i, hit) in r.region_glyph_hits.iter().enumerate() {
-                                if *hit {
-                                    survived_runs.region_glyph_hits[i] = true;
-                                }
-                            }
+                            merge_region_hits(
+                                &mut survived_runs.region_glyph_hits,
+                                &r.region_glyph_hits,
+                            );
                         },
                         TextElement::Offset(off) => {
                             let dx = (-*off / 1000.0) * ts.tfs * ts.th;
@@ -551,6 +547,17 @@ fn show_strings(op: &Operator) -> Vec<&[u8]> {
     }
 }
 
+fn merge_region_hits(destination: &mut Vec<bool>, source: &[bool]) {
+    if destination.len() < source.len() {
+        destination.resize(source.len(), false);
+    }
+    for (i, hit) in source.iter().enumerate() {
+        if *hit {
+            destination[i] = true;
+        }
+    }
+}
+
 /// Accumulate one show's prune result. `orig_len` is the original
 /// show-string payload byte count; removed bytes = `orig_len` minus the
 /// surviving runs' bytes (re-serialization float bloat makes a raw
@@ -564,14 +571,7 @@ fn account(result: &mut TextEngineResult, orig_len: usize, res: &TextPruneResult
             result.removed_codes.push(*c);
         }
     }
-    if result.glyph_region_hits.len() < res.region_glyph_hits.len() {
-        result.glyph_region_hits.resize(res.region_glyph_hits.len(), false);
-    }
-    for (i, hit) in res.region_glyph_hits.iter().enumerate() {
-        if *hit {
-            result.glyph_region_hits[i] = true;
-        }
-    }
+    merge_region_hits(&mut result.glyph_region_hits, &res.region_glyph_hits);
 }
 
 #[cfg(test)]
