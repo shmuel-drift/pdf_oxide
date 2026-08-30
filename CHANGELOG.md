@@ -4,10 +4,12 @@ All notable changes to PDFOxide are documented here.
 
 ## [Unreleased]
 
-> Fork: destructive redaction burns JPEG/Flate image pixels under each redaction
-> rectangle (not overlay-only), then hard-drops unused original streams so
-> extractors cannot recover the secret. Intersecting vector paint and
-> unprovable shadings fail closed instead of overlay-only.
+## [0.3.78-fork.2] - 2026-08-30
+
+> Fork pre-release: destructive redaction burns JPEG/Flate image pixels under
+> each redaction rectangle (not overlay-only), then hard-drops unused original
+> streams so extractors cannot recover the secret. Intersecting vector paint
+> and unprovable shadings fail closed instead of overlay-only.
 
 ### Added
 
