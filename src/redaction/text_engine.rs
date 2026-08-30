@@ -126,6 +126,8 @@ pub struct TextEngineResult {
     /// overlays appended after these operators must map page-space
     /// regions through the inverse of this matrix into stream space.
     pub final_ctm: Matrix,
+    /// Parallel to the input `RegionSet.regions` (empty if no regions).
+    pub(crate) glyph_region_hits: Vec<bool>,
 }
 
 /// Stable non-cryptographic hash of a font resource name → the `u32`
@@ -285,6 +287,7 @@ pub fn redact_text_stream(
     let mut ts = TextState::default();
     let mut out: Vec<Operator> = Vec::with_capacity(ops.len());
     let mut result = TextEngineResult::default();
+    result.glyph_region_hits = vec![false; regions.len()];
 
     for op in ops {
         match op {
@@ -441,6 +444,7 @@ pub fn redact_text_stream(
                 let mut any_removed = false;
                 let mut tj_orig = 0usize;
                 let mut survived_runs = TextPruneResult::default();
+                survived_runs.region_glyph_hits = vec![false; regions.len()];
                 for el in array {
                     match el {
                         TextElement::String(s) => {
@@ -456,6 +460,14 @@ pub fn redact_text_stream(
                             }
                             survived_runs.glyphs_removed += r.glyphs_removed;
                             survived_runs.runs.extend(r.runs);
+                            if survived_runs.region_glyph_hits.len() < r.region_glyph_hits.len() {
+                                survived_runs.region_glyph_hits.resize(r.region_glyph_hits.len(), false);
+                            }
+                            for (i, hit) in r.region_glyph_hits.iter().enumerate() {
+                                if *hit {
+                                    survived_runs.region_glyph_hits[i] = true;
+                                }
+                            }
                         },
                         TextElement::Offset(off) => {
                             let dx = (-*off / 1000.0) * ts.tfs * ts.th;
@@ -550,6 +562,14 @@ fn account(result: &mut TextEngineResult, orig_len: usize, res: &TextPruneResult
     for c in &res.removed_codes {
         if !result.removed_codes.contains(c) {
             result.removed_codes.push(*c);
+        }
+    }
+    if result.glyph_region_hits.len() < res.region_glyph_hits.len() {
+        result.glyph_region_hits.resize(res.region_glyph_hits.len(), false);
+    }
+    for (i, hit) in res.region_glyph_hits.iter().enumerate() {
+        if *hit {
+            result.glyph_region_hits[i] = true;
         }
     }
 }
@@ -789,6 +809,7 @@ mod tests {
         let r = regions(90.0, 95.0, 300.0, 115.0);
         let out = redact_text_stream(&ops, &r, DEFAULT_EDGE_PADDING, &Stub);
         assert_eq!(out.glyphs_removed, 4);
+        assert_eq!(out.glyph_region_hits, vec![true]);
         // No TJ survives → no residual offset array that could encode
         // removed-glyph advances (G2).
         assert!(!out
