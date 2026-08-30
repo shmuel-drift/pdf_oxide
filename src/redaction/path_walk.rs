@@ -7,6 +7,8 @@
 //! Clip-and-discard (`W`/`W*` then `n`) is ignored: page-sized clip rects
 //! are ubiquitous and are not the secret drawing. Clip-and-paint
 //! (`W` then `f`/`S`) still fails closed — clip does not end the path.
+//! Near-full-page paper fills (Print-to-PDF white sheets) are ignored when
+//! the page MediaBox is passed in.
 
 use super::classify::{apply_ctm, classify, transform_bbox};
 use super::path_prune::polygon_bbox;
@@ -258,7 +260,56 @@ pub fn intersecting_unburnable(
                     None => return Some(UnburnableMark::Shading),
                 },
             },
-            _ => {},
+            // No `_` arm: `Operator` is exhaustive in this crate. A new
+            // variant from upstream must be classified here (implement or
+            // ignore) so fail-closed cannot silently overlay-only.
+            //
+            // These ops do not paint path geometry in *this* walker.
+            // Text is glyph-pruned elsewhere; `Do` / inline images are
+            // handled by `burn_stream` / `walk_stream_images`; color,
+            // marked content, dash/cap/join, and unknown `Other` names
+            // do not change the path hit test.
+            Operator::Td { .. }
+            | Operator::TD { .. }
+            | Operator::Tm { .. }
+            | Operator::TStar
+            | Operator::Tj { .. }
+            | Operator::TJ { .. }
+            | Operator::Quote { .. }
+            | Operator::DoubleQuote { .. }
+            | Operator::Tc { .. }
+            | Operator::Tw { .. }
+            | Operator::Tz { .. }
+            | Operator::TL { .. }
+            | Operator::Tf { .. }
+            | Operator::Tr { .. }
+            | Operator::Ts { .. }
+            | Operator::BeginText
+            | Operator::EndText
+            | Operator::SetFillRgb { .. }
+            | Operator::SetStrokeRgb { .. }
+            | Operator::SetFillGray { .. }
+            | Operator::SetStrokeGray { .. }
+            | Operator::SetFillCmyk { .. }
+            | Operator::SetStrokeCmyk { .. }
+            | Operator::SetFillColorSpace { .. }
+            | Operator::SetStrokeColorSpace { .. }
+            | Operator::SetFillColor { .. }
+            | Operator::SetStrokeColor { .. }
+            | Operator::SetFillColorN { .. }
+            | Operator::SetStrokeColorN { .. }
+            | Operator::Do { .. }
+            | Operator::InlineImage { .. }
+            | Operator::SetDash { .. }
+            | Operator::SetLineCap { .. }
+            | Operator::SetLineJoin { .. }
+            | Operator::SetMiterLimit { .. }
+            | Operator::SetRenderingIntent { .. }
+            | Operator::SetFlatness { .. }
+            | Operator::BeginMarkedContent { .. }
+            | Operator::BeginMarkedContentDict { .. }
+            | Operator::EndMarkedContent
+            | Operator::Other { .. } => {},
         }
     }
     None
