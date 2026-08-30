@@ -206,6 +206,20 @@ impl RegionSet {
             .iter()
             .any(|r| r.intersects_rect(mark, min_padding))
     }
+
+    /// Boxes that stripped no glyphs and burned no pixels. Path/`sh`/`gs`
+    /// refuse uses this subset only.
+    pub(crate) fn leftover_paint_targets(&self, glyph_hits: &[bool], image_hits: &[bool]) -> Self {
+        let mut out = Self::new(self.page_index);
+        for (i, r) in self.regions.iter().enumerate() {
+            let g = glyph_hits.get(i).copied().unwrap_or(false);
+            let im = image_hits.get(i).copied().unwrap_or(false);
+            if !g && !im {
+                out.push(*r);
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +380,18 @@ mod tests {
         ] {
             assert!(page.intersects_rect(&mark, DEFAULT_EDGE_PADDING));
         }
+    }
+
+    #[test]
+    fn leftover_paint_targets_keeps_only_undestroyed_boxes() {
+        let mut rs = RegionSet::new(3);
+        rs.push(RedactionRegion::from_rect(0.0, 0.0, 10.0, 10.0, None));
+        rs.push(RedactionRegion::from_rect(20.0, 20.0, 30.0, 30.0, None));
+        rs.push(RedactionRegion::from_rect(40.0, 40.0, 50.0, 50.0, None));
+        let left = rs.leftover_paint_targets(&[true, false, false], &[false, false, true]);
+        assert_eq!(left.page_index, 3);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left.regions[0].bbox, [20.0, 20.0, 30.0, 30.0]);
     }
 
     #[test]
