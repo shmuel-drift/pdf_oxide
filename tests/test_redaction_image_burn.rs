@@ -700,3 +700,71 @@ fn encrypted_without_auth_fails_apply() {
     let msg = err.to_string().to_lowercase();
     assert!(msg.contains("encrypt") || msg.contains("password"), "unexpected error: {err}");
 }
+
+#[test]
+fn jpeg_plus_page_fill_same_box_saves() {
+    let w = 64u32;
+    let h = 64u32;
+    let jpeg = encode_jpeg_rgb(w, h, &magenta_on_green(w, h));
+    let extra = format!(" 0 0 {w} {h} re f");
+    let src = jpeg_page_pdf(w, h, &jpeg, &extra, None);
+    let mut ed = DocumentEditor::from_bytes(src).unwrap();
+    ed.add_redaction(0, [16.0, 16.0, 48.0, 48.0], None)
+        .unwrap();
+    ed.apply_redactions_destructive(RedactionOptions::default())
+        .expect("white fill must not block JPEG burn");
+    let out = save_raw(&mut ed);
+    assert!(
+        !has_magenta(&extracted_rgb(&out, 0)),
+        "secret pixels must be burned"
+    );
+}
+
+#[test]
+fn jpeg_box_and_path_title_box_same_apply_refuses() {
+    let w = 64u32;
+    let h = 64u32;
+    let jpeg = encode_jpeg_rgb(w, h, &magenta_on_green(w, h));
+    let contents = format!("q {w} 0 0 {h} 0 0 cm /Im1 Do Q 0 80 40 10 re f");
+    let src = assemble_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>\n".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} 100] \
+             /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >>\n"
+        )
+        .into_bytes(),
+        stream_obj("", contents.as_bytes()),
+        image_xobject("DCTDecode", w, h, "DeviceRGB", 8, &jpeg),
+    ]);
+    let mut ed = DocumentEditor::from_bytes(src).unwrap();
+    ed.add_redaction(0, [16.0, 16.0, 48.0, 48.0], None)
+        .unwrap();
+    ed.add_redaction(0, [0.0, 80.0, 40.0, 90.0], None)
+        .unwrap();
+    ed.apply_redactions_destructive(RedactionOptions::default())
+        .expect_err("outlined title box must fail the whole apply");
+    let out = save_raw(&mut ed);
+    assert!(
+        has_magenta(&extracted_rgb(&out, 0)),
+        "failed apply must roll back JPEG burn"
+    );
+}
+
+#[test]
+fn typed_glyphs_do_not_skip_inline_bi_refuse() {
+    let contents = b"BT /F1 10 Tf 1 0 0 1 0 20 Tm (HI) Tj ET\nq 10 0 0 10 0 0 cm BI /W 2 /H 2 /CS /DeviceRGB /BPC 8 ID \x00\xff\x00\x00\xff\x00\x00\xff\x00\x00\xff\x00 EI Q";
+    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\n".to_vec();
+    let pdf = assemble_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>\n".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\n".to_vec(),
+        stream_obj("", contents),
+        font,
+    ]);
+    let mut ed = DocumentEditor::from_bytes(pdf).unwrap();
+    ed.add_redaction(0, [0.0, 0.0, 20.0, 30.0], None)
+        .unwrap();
+    ed.apply_redactions_destructive(RedactionOptions::default())
+        .expect_err("BI must still refuse");
+}
