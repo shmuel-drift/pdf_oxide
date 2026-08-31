@@ -4,6 +4,11 @@ All notable changes to PDFOxide are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- **`path_walk` matches `Operator` exhaustively** (no `_` arm). A new
+  variant from upstream is a compile error instead of a silent ignore.
+
 ## [0.3.78-fork.2] - 2026-08-30
 
 > Fork pre-release: destructive redaction burns JPEG/Flate image pixels under
