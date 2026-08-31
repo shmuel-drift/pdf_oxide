@@ -771,6 +771,12 @@ fn typed_glyphs_do_not_skip_inline_bi_refuse() {
     let mut ed = DocumentEditor::from_bytes(pdf).unwrap();
     ed.add_redaction(0, [0.0, 0.0, 20.0, 30.0], None)
         .unwrap();
-    ed.apply_redactions_destructive(RedactionOptions::default())
+    let err = ed
+        .apply_redactions_destructive(RedactionOptions::default())
         .expect_err("BI must still refuse");
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("inline") || msg.contains("BI"),
+        "unexpected error: {msg}"
+    );
 }

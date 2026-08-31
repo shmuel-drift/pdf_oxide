@@ -820,6 +820,52 @@ mod tests {
     }
 
     #[test]
+    fn tj_string_parts_or_hits_across_regions() {
+        // [(AB) -200 (CD)] TJ at (100,100): AB is near x=100..110 and
+        // CD starts near x=112 after the -200 adjustment.
+        let ops = vec![
+            Operator::BeginText,
+            Operator::Tf {
+                font: "F1".into(),
+                size: 10.0,
+            },
+            Operator::Tm {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                e: 100.0,
+                f: 100.0,
+            },
+            Operator::TJ {
+                array: vec![
+                    TextElement::String(b"AB".to_vec()),
+                    TextElement::Offset(-200.0),
+                    TextElement::String(b"CD".to_vec()),
+                ],
+            },
+            Operator::EndText,
+        ];
+        let mut regions = RegionSet::new(0);
+        regions.push(RedactionRegion::from_rect(
+            99.0,
+            95.0,
+            111.0,
+            115.0,
+            Some([0.0, 0.0, 0.0]),
+        ));
+        regions.push(RedactionRegion::from_rect(
+            111.5,
+            95.0,
+            123.0,
+            115.0,
+            Some([0.0, 0.0, 0.0]),
+        ));
+        let out = redact_text_stream(&ops, &regions, DEFAULT_EDGE_PADDING, &Stub);
+        assert_eq!(out.glyph_region_hits, vec![true, true]);
+    }
+
+    #[test]
     fn untouched_tj_array_emitted_byte_identical() {
         let ops = vec![
             Operator::BeginText,

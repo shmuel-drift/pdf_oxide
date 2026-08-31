@@ -9,10 +9,10 @@
 //!    region and re-emits survivors with absolute `Tm`, no `TJ` deltas
 //!    (G1/G2). A composite/Type0/unknown font ⇒ **hard refusal**
 //!    (`Err`), never a silent pass-through (feature plan §9 risk 6).
-//! 3. `serialize` re-serializes survivors (binary-safe strings, G6).
-//! 4. Leftover vector paint (paths/`sh`) in a region that did **not**
+//! 3. Leftover vector paint (paths/`sh`) in a region that did **not**
 //!    strip glyphs is refused; paint in a region that already had its
 //!    glyphs removed is allowed to remain (word-only Save rule).
+//! 4. `serialize` re-serializes survivors (binary-safe strings, G6).
 //! 5. `overlay` maps each page-space region through the inverse of the
 //!    CTM left active at stream end, then appends one opaque block per
 //!    region *after* the pruned content so the redacted area is visibly
