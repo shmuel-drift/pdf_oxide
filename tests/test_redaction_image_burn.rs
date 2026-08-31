@@ -711,12 +711,18 @@ fn jpeg_plus_page_fill_same_box_saves() {
     let mut ed = DocumentEditor::from_bytes(src).unwrap();
     ed.add_redaction(0, [16.0, 16.0, 48.0, 48.0], None)
         .unwrap();
-    ed.apply_redactions_destructive(RedactionOptions::default())
+    let report = ed
+        .apply_redactions_destructive(RedactionOptions::default())
         .expect("white fill must not block JPEG burn");
+    assert!(report.images_modified >= 1, "report = {report:?}");
     let out = save_raw(&mut ed);
     assert!(
         !has_magenta(&extracted_rgb(&out, 0)),
         "secret pixels must be burned"
+    );
+    assert!(
+        !contains_bytes(&out, &jpeg),
+        "original JPEG stream must be absent from the file"
     );
 }
 
