@@ -210,6 +210,8 @@ impl RegionSet {
     /// Boxes that stripped no glyphs and burned no pixels. Path/`sh`/`gs`
     /// refuse uses this subset only.
     pub(crate) fn leftover_paint_targets(&self, glyph_hits: &[bool], image_hits: &[bool]) -> Self {
+        debug_assert_eq!(glyph_hits.len(), self.len());
+        debug_assert_eq!(image_hits.len(), self.len());
         let mut out = Self::new(self.page_index);
         for (i, r) in self.regions.iter().enumerate() {
             let g = glyph_hits.get(i).copied().unwrap_or(false);
@@ -219,6 +221,19 @@ impl RegionSet {
             }
         }
         out
+    }
+}
+
+/// OR-merge `source` into `destination` by region index. Grows
+/// `destination` if `source` is longer.
+pub(crate) fn merge_region_hits(destination: &mut Vec<bool>, source: &[bool]) {
+    if destination.len() < source.len() {
+        destination.resize(source.len(), false);
+    }
+    for (i, hit) in source.iter().enumerate() {
+        if *hit {
+            destination[i] = true;
+        }
     }
 }
 

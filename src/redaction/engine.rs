@@ -164,7 +164,8 @@ pub fn redact_content_stream(
         ));
     }
 
-    let leftover = regions.leftover_paint_targets(&te.glyph_region_hits, &[]);
+    let image_hits = vec![false; regions.len()];
+    let leftover = regions.leftover_paint_targets(&te.glyph_region_hits, &image_hits);
     if !leftover.is_empty() {
         refuse_intersecting_unburnable(
             &ops,

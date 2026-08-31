@@ -7263,8 +7263,7 @@ impl DocumentEditor {
             }
         };
 
-        let leftover =
-            rs.leftover_paint_targets(&glyph_region_hits, &burn.image_region_hits);
+        let leftover = rs.leftover_paint_targets(&glyph_region_hits, &burn.image_region_hits);
         if !leftover.is_empty() {
             let leftover_resources = {
                 let mut res = resources.clone();

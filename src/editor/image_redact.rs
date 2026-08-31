@@ -13,11 +13,11 @@ use crate::redaction::image_burn::{
     assert_image_burnable, burn_image_wipes, burned_xobject, MAX_FORM_DEPTH,
 };
 use crate::redaction::image_prune::{
-    classify_image_placement, classify_image_wipes, ImageRedaction,
+    classify_image_placement, classify_image_wipes, image_wipe_region_hits, ImageRedaction,
 };
 use crate::redaction::image_walk::{form_matrix_from_dict, walk_stream_images, DoPlacement};
 use crate::redaction::path_walk::refuse_intersecting_unburnable;
-use crate::redaction::region::RegionSet;
+use crate::redaction::region::{merge_region_hits, RegionSet};
 use crate::redaction::serialize::serialize_operator;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -323,10 +323,7 @@ impl DocumentEditor {
                             visiting.remove(&r.id);
                         }
                         let inner = inner?;
-                        crate::redaction::text_engine::merge_region_hits(
-                            &mut image_region_hits,
-                            &inner.image_region_hits,
-                        );
+                        merge_region_hits(&mut image_region_hits, &inner.image_region_hits);
                         inners.push((p.clone(), inner));
                     }
 
@@ -387,15 +384,6 @@ impl DocumentEditor {
                     }
                 },
                 "Image" => {
-                    for p in &placements {
-                        let hits = crate::redaction::image_prune::image_wipe_region_hits(
-                            &p.ctm, regions, padding,
-                        );
-                        crate::redaction::text_engine::merge_region_hits(
-                            &mut image_region_hits,
-                            &hits,
-                        );
-                    }
                     let classified: Vec<(DoPlacement, Vec<ImageRedaction>)> = placements
                         .iter()
                         .map(|p| (p.clone(), classify_image_wipes(&p.ctm, regions, padding)))
@@ -424,10 +412,14 @@ impl DocumentEditor {
                     // One placement: rebind the original name. Several: clone
                     // each so wipe sets do not merge into one JPEG.
                     if placements.len() == 1 {
-                        let Some((_p, wipes)) = affected.into_iter().next() else {
+                        let Some((p, wipes)) = affected.into_iter().next() else {
                             continue;
                         };
                         let burned = burn_image_wipes(&extracted, wipes)?;
+                        merge_region_hits(
+                            &mut image_region_hits,
+                            &image_wipe_region_hits(&p.ctm, regions, padding),
+                        );
                         let new_id = self.allocate_object_id();
                         self.insert_modified(new_id, burned_xobject(burned));
                         xobject_patch
@@ -442,6 +434,10 @@ impl DocumentEditor {
                         let affected_len = affected.len();
                         for (p, wipes) in affected {
                             let burned = burn_image_wipes(&extracted, wipes)?;
+                            merge_region_hits(
+                                &mut image_region_hits,
+                                &image_wipe_region_hits(&p.ctm, regions, padding),
+                            );
                             let new_id = self.allocate_object_id();
                             self.insert_modified(new_id, burned_xobject(burned));
                             let new_name = Self::unique_xobject_name(&name, &used_names);

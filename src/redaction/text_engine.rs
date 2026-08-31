@@ -22,7 +22,7 @@
 //! trait abstracts width/encoding so the security-critical logic is
 //! exhaustively unit-testable without a real document.
 
-use super::region::RegionSet;
+use super::region::{merge_region_hits, RegionSet};
 use super::text_prune::{prune_run, Glyph, TextPruneResult};
 use crate::content::graphics_state::{GraphicsStateStack, Matrix};
 use crate::content::operators::{Operator, TextElement};
@@ -547,17 +547,6 @@ fn show_strings(op: &Operator) -> Vec<&[u8]> {
     }
 }
 
-pub(crate) fn merge_region_hits(destination: &mut Vec<bool>, source: &[bool]) {
-    if destination.len() < source.len() {
-        destination.resize(source.len(), false);
-    }
-    for (i, hit) in source.iter().enumerate() {
-        if *hit {
-            destination[i] = true;
-        }
-    }
-}
-
 /// Accumulate one show's prune result. `orig_len` is the original
 /// show-string payload byte count; removed bytes = `orig_len` minus the
 /// surviving runs' bytes (re-serialization float bloat makes a raw
@@ -847,20 +836,8 @@ mod tests {
             Operator::EndText,
         ];
         let mut regions = RegionSet::new(0);
-        regions.push(RedactionRegion::from_rect(
-            99.0,
-            95.0,
-            111.0,
-            115.0,
-            Some([0.0, 0.0, 0.0]),
-        ));
-        regions.push(RedactionRegion::from_rect(
-            111.5,
-            95.0,
-            123.0,
-            115.0,
-            Some([0.0, 0.0, 0.0]),
-        ));
+        regions.push(RedactionRegion::from_rect(99.0, 95.0, 111.0, 115.0, Some([0.0, 0.0, 0.0])));
+        regions.push(RedactionRegion::from_rect(111.5, 95.0, 123.0, 115.0, Some([0.0, 0.0, 0.0])));
         let out = redact_text_stream(&ops, &regions, DEFAULT_EDGE_PADDING, &Stub);
         assert_eq!(out.glyph_region_hits, vec![true, true]);
     }
