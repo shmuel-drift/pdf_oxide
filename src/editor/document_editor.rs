@@ -7125,7 +7125,8 @@ impl DocumentEditor {
     /// rectangles + source `/Redact` annotations): intersecting vector
     /// text is removed, JPEG/Flate pixels are burned, and an opaque
     /// overlay is drawn. Intersecting vector **paint** and unprovable
-    /// shadings refuse the apply (overlay-only would leave the drawing
+    /// shadings refuse the apply only for boxes that stripped no glyphs
+    /// and burned no pixels (overlay-only would leave the drawing
     /// extractable). The redacted pages' content is rewritten so that a
     /// subsequent garbage-collected full-rewrite save (the default
     /// [`save_to_bytes`]/[`save`]) leaves no residual recoverable bytes
@@ -7231,11 +7232,12 @@ impl DocumentEditor {
         let final_ctm = te.final_ctm;
         let glyphs_removed = te.glyphs_removed;
         let bytes_removed = te.bytes_removed;
+        let glyph_region_hits = te.glyph_region_hits.clone();
+        let resources = self.resolve_page_resources(src)?;
 
         let burn = {
             let result = (|| {
                 self.queue_drop_page_preview(src)?;
-                let resources = self.resolve_page_resources(src)?;
                 let mut visiting = std::collections::HashSet::new();
                 self.burn_stream(
                     te.operators,
@@ -7260,6 +7262,29 @@ impl DocumentEditor {
                 },
             }
         };
+
+        let leftover =
+            rs.leftover_paint_targets(&glyph_region_hits, &burn.image_region_hits);
+        if !leftover.is_empty() {
+            let mut visiting = std::collections::HashSet::new();
+            if let Err(e) = self.refuse_leftover_paint(
+                &burn.ops,
+                &resources,
+                Matrix::identity(),
+                &leftover,
+                opts.edge_padding,
+                &mut visiting,
+                0,
+            ) {
+                self.modified_objects = objects_snapshot;
+                self.next_object_id = next_id_snapshot;
+                self.redacted_orphan_ids = orphans_snapshot;
+                self.redacted_xobject_rebinds = rebinds_snapshot;
+                self.redacted_drop_preview = drop_snapshot;
+                self.burn_replaced_ids = replaced_snapshot;
+                return Err(e);
+            }
+        }
 
         let mut body = Vec::with_capacity(content.len());
         for op in &burn.ops {

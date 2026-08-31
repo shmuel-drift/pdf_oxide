@@ -50,6 +50,7 @@ pub(super) struct BurnStreamResult {
     pub images_modified: usize,
     pub xobjects_specialized: usize,
     pub replaced_ids: HashSet<u32>,
+    pub(crate) image_region_hits: Vec<bool>,
 }
 
 impl DocumentEditor {
@@ -262,16 +263,6 @@ impl DocumentEditor {
                 "Form XObject nesting exceeds {MAX_FORM_DEPTH}"
             )));
         }
-        let shading = self.shading_bboxes(resources);
-        let gs_lw = self.ext_gstate_line_widths(resources);
-        refuse_intersecting_unburnable(
-            &ops,
-            initial_ctm,
-            regions,
-            padding,
-            Some(&shading),
-            Some(&gs_lw),
-        )?;
         let walk = walk_stream_images(&ops, initial_ctm, regions, padding);
         if walk.intersecting_inline {
             return Err(Error::Unsupported("redaction cannot burn inline (BI) images".to_string()));
@@ -282,6 +273,7 @@ impl DocumentEditor {
         let mut images_modified = 0usize;
         let mut xobjects_specialized = 0usize;
         let mut replaced_ids: HashSet<u32> = HashSet::new();
+        let mut image_region_hits = vec![false; regions.len()];
 
         let mut used_names: HashSet<String> =
             self.xobject_entries(resources)?.keys().cloned().collect();
@@ -330,7 +322,12 @@ impl DocumentEditor {
                         if let Some(r) = obj_ref {
                             visiting.remove(&r.id);
                         }
-                        inners.push((p.clone(), inner?));
+                        let inner = inner?;
+                        crate::redaction::text_engine::merge_region_hits(
+                            &mut image_region_hits,
+                            &inner.image_region_hits,
+                        );
+                        inners.push((p.clone(), inner));
                     }
 
                     let affected: Vec<(DoPlacement, BurnStreamResult)> = inners
@@ -390,6 +387,15 @@ impl DocumentEditor {
                     }
                 },
                 "Image" => {
+                    for p in &placements {
+                        let hits = crate::redaction::image_prune::image_wipe_region_hits(
+                            &p.ctm, regions, padding,
+                        );
+                        crate::redaction::text_engine::merge_region_hits(
+                            &mut image_region_hits,
+                            &hits,
+                        );
+                    }
                     let classified: Vec<(DoPlacement, Vec<ImageRedaction>)> = placements
                         .iter()
                         .map(|p| (p.clone(), classify_image_wipes(&p.ctm, regions, padding)))
@@ -478,7 +484,79 @@ impl DocumentEditor {
             images_modified,
             xobjects_specialized,
             replaced_ids,
+            image_region_hits,
         })
+    }
+
+    pub(super) fn refuse_leftover_paint(
+        &self,
+        ops: &[Operator],
+        resources: &HashMap<String, Object>,
+        initial_ctm: Matrix,
+        regions: &RegionSet,
+        padding: f32,
+        visiting: &mut HashSet<u32>,
+        depth: u32,
+    ) -> Result<()> {
+        if regions.is_empty() {
+            return Ok(());
+        }
+        if depth > MAX_FORM_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "Form XObject nesting exceeds {MAX_FORM_DEPTH}"
+            )));
+        }
+        let shading = self.shading_bboxes(resources);
+        let gs_lw = self.ext_gstate_line_widths(resources);
+        refuse_intersecting_unburnable(
+            ops,
+            initial_ctm,
+            regions,
+            padding,
+            Some(&shading),
+            Some(&gs_lw),
+        )?;
+        let walk = walk_stream_images(ops, initial_ctm, regions, padding);
+        for d in &walk.dos {
+            let (obj_ref, obj) = self.resolve_xobject(resources, &d.name)?;
+            if Self::xobject_subtype(&obj) != "Form" {
+                continue;
+            }
+            let form_dict = obj
+                .as_dict()
+                .ok_or_else(|| Error::InvalidPdf("Form is not a stream".to_string()))?;
+            let form_matrix = form_matrix_from_dict(form_dict);
+            let form_res = if let Some(res_obj) = form_dict.get("Resources") {
+                self.as_dict_resolved(res_obj)?
+            } else {
+                resources.clone()
+            };
+            let form_bytes = self.decode_xobject_stream(&obj, obj_ref)?;
+            let form_ops = crate::content::parser::parse_content_stream(&form_bytes)?;
+            if let Some(r) = obj_ref {
+                if !visiting.insert(r.id) {
+                    return Err(Error::Unsupported(format!(
+                        "cyclic Form XObject {} while redacting",
+                        r.id
+                    )));
+                }
+            }
+            let composed = form_matrix.multiply(&d.ctm);
+            let inner = self.refuse_leftover_paint(
+                &form_ops,
+                &form_res,
+                composed,
+                regions,
+                padding,
+                visiting,
+                depth + 1,
+            );
+            if let Some(r) = obj_ref {
+                visiting.remove(&r.id);
+            }
+            inner?;
+        }
+        Ok(())
     }
 
     fn clone_form_with_inner(
