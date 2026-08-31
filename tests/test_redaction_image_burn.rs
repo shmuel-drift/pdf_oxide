@@ -313,6 +313,42 @@ fn jpeg_inside_form_is_burned() {
 }
 
 #[test]
+fn renamed_form_resources_are_available_to_leftover_path_walk() {
+    let w = 16u32;
+    let h = 16u32;
+    let jpeg = encode_jpeg_rgb(w, h, &magenta_on_green(w, h));
+    let page_c = b"q 1 0 0 1 0 0 cm /Fm1 Do Q q 1 0 0 1 32 0 cm /Fm1 Do Q";
+    let form_c = b"q 8 0 0 8 0 0 cm /Im1 Do Q 2 12 m 14 12 l S";
+    let pdf = assemble_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>\n".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 48 16] \
+           /Contents 4 0 R /Resources << /XObject << /Fm1 5 0 R >> >> >>\n"
+            .to_vec(),
+        stream_obj("", page_c),
+        stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 16 16] \
+             /Resources << /XObject << /Im1 6 0 R >> >>",
+            form_c,
+        ),
+        image_xobject("DCTDecode", w, h, "DeviceRGB", 8, &jpeg),
+    ]);
+
+    let mut ed = DocumentEditor::from_bytes(pdf).unwrap();
+    ed.add_redaction(0, [0.0, 0.0, 8.0, 8.0], None).unwrap();
+    ed.add_redaction(0, [10.0, 10.0, 16.0, 14.0], None).unwrap();
+    let err = ed
+        .apply_redactions_destructive(RedactionOptions::default())
+        .expect_err("undestroyed Form path must refuse the apply");
+    let msg = err.to_string();
+    assert!(msg.contains("vector path"), "{msg}");
+    assert!(!msg.contains("no XObject resource"), "{msg}");
+
+    let out = save_raw(&mut ed);
+    assert!(contains_bytes(&out, &jpeg), "failed apply must roll back the burned JPEG");
+}
+
+#[test]
 fn form_page_scale_form_translate_maps_holes() {
     // Crate multiply is self-then-other (same as `cm`): Form /Matrix T(2,1)
     // then page S(32) → image at [64,32]–[96,64]. Swapped order would put

@@ -7266,10 +7266,19 @@ impl DocumentEditor {
         let leftover =
             rs.leftover_paint_targets(&glyph_region_hits, &burn.image_region_hits);
         if !leftover.is_empty() {
+            let leftover_resources = {
+                let mut res = resources.clone();
+                if !burn.xobject_patch.is_empty() {
+                    let mut xo = self.xobject_entries(&res)?;
+                    burn.xobject_patch.apply_to(&mut xo);
+                    res.insert("XObject".to_string(), Object::Dictionary(xo));
+                }
+                res
+            };
             let mut visiting = std::collections::HashSet::new();
             if let Err(e) = self.refuse_leftover_paint(
                 &burn.ops,
-                &resources,
+                &leftover_resources,
                 Matrix::identity(),
                 &leftover,
                 opts.edge_padding,

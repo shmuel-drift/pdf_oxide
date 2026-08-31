@@ -34,7 +34,7 @@ impl XObjectPatch {
         self.rebinds.is_empty() && self.drop_names.is_empty()
     }
 
-    fn apply_to(&self, xo: &mut HashMap<String, Object>) {
+    pub(super) fn apply_to(&self, xo: &mut HashMap<String, Object>) {
         for name in &self.drop_names {
             xo.remove(name);
         }
@@ -102,7 +102,7 @@ impl DocumentEditor {
         Ok(HashMap::new())
     }
 
-    fn xobject_entries(
+    pub(super) fn xobject_entries(
         &self,
         resources: &HashMap<String, Object>,
     ) -> Result<HashMap<String, Object>> {
