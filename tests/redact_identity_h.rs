@@ -22,11 +22,16 @@ struct Run {
 /// Minimal Type0/Identity-H PDF. Each glyph advances 12pt (W=1000 at 12 Tf);
 /// each run is its own `BT…ET`. `/ToUnicode` maps every CID to its scalar.
 fn identity_h_pdf(runs: &[Run]) -> Vec<u8> {
+    identity_h_pdf_with_extra(runs, "")
+}
+
+fn identity_h_pdf_with_extra(runs: &[Run], extra_content: &str) -> Vec<u8> {
     let mut content = String::new();
     for r in runs {
         let hex: String = r.codes.iter().map(|c| format!("{c:04X}")).collect();
         content.push_str(&format!("BT /F1 12 Tf 1 0 0 1 {:.1} {:.1} Tm <{hex}> Tj ET\n", r.x, r.y));
     }
+    content.push_str(extra_content);
     let mut pairs: Vec<(u16, char)> = Vec::new();
     for r in runs {
         for (code, ch) in r.codes.iter().zip(r.text.chars()) {
@@ -159,4 +164,49 @@ fn identity_h_destructive_redaction_targets_only_the_region() {
         .unwrap();
     assert!(!after.contains("SECRET"), "target run must be gone, got: {after:?}");
     assert!(after.contains("PUBLIC"), "non-target run must survive, got: {after:?}");
+}
+
+#[test]
+fn identity_h_plus_underline_in_same_box_saves() {
+    // Wikipedia-style CID show: Type0 / Identity-H hex Tj. Underline through
+    // SECRET (6 glyphs × 12pt at y=700) sits in the same box and must not
+    // refuse Save after glyphs are stripped.
+    let runs = [
+        Run {
+            x: 100.0,
+            y: 700.0,
+            text: "SECRET",
+            codes: &[1, 2, 3, 4, 5, 6],
+        },
+        Run {
+            x: 100.0,
+            y: 660.0,
+            text: "PUBLIC",
+            codes: &[7, 8, 9, 10, 11, 12],
+        },
+    ];
+    let src = identity_h_pdf_with_extra(&runs, "100 698 m 172 698 l S\n");
+
+    let mut ed = DocumentEditor::from_bytes(src).expect("open editor");
+    ed.add_redaction(0, [90.0, 690.0, 220.0, 720.0], None)
+        .expect("queue redaction");
+    ed.apply_redactions_destructive(RedactionOptions::default())
+        .expect("Identity-H underline must not block stripped glyphs");
+
+    let out = ed
+        .save_to_bytes_with_options(pdf_oxide::editor::SaveOptions {
+            compress: false,
+            ..pdf_oxide::editor::SaveOptions::full_rewrite()
+        })
+        .expect("save redacted pdf");
+    let after = PdfDocument::from_bytes(out.clone())
+        .unwrap()
+        .extract_text(0)
+        .unwrap();
+    assert!(!after.contains("SECRET"), "target run must be gone, got: {after:?}");
+    assert!(after.contains("PUBLIC"), "non-target run must survive, got: {after:?}");
+    assert!(
+        out.windows(3).any(|w| w == b"698"),
+        "underline stroke and its 698 coordinates must survive"
+    );
 }

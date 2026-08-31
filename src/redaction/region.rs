@@ -206,6 +206,46 @@ impl RegionSet {
             .iter()
             .any(|r| r.intersects_rect(mark, min_padding))
     }
+
+    /// Redaction boxes where this apply destroyed neither typed glyphs
+    /// nor image pixels. Path/`sh`/`gs` refuse runs on this subset only:
+    /// a box that already lost letters (or burned JPEG/Flate pixels) may
+    /// keep underlines, frames, and page fills.
+    ///
+    /// This is per box, not per path. A single fat rectangle covering both
+    /// a screenshot and an outlined title will skip the title path check
+    /// after the pixels burn — that hole is accepted.
+    ///
+    /// A missing flag (`get` past the end) is treated as false: the box
+    /// is *not* considered destroyed, so paint is still refused (fail closed).
+    pub(crate) fn regions_with_no_destroyed_content(
+        &self,
+        stripped_glyphs_by_region: &[bool],
+        burned_pixels_by_region: &[bool],
+    ) -> Self {
+        debug_assert_eq!(stripped_glyphs_by_region.len(), self.len());
+        debug_assert_eq!(burned_pixels_by_region.len(), self.len());
+        let mut out = Self::new(self.page_index);
+        for (i, r) in self.regions.iter().enumerate() {
+            let stripped_glyphs = stripped_glyphs_by_region.get(i).copied().unwrap_or(false);
+            let burned_pixels = burned_pixels_by_region.get(i).copied().unwrap_or(false);
+            if !stripped_glyphs && !burned_pixels {
+                out.push(*r);
+            }
+        }
+        out
+    }
+}
+
+/// Set `destination[i] = true` wherever `source[i]` is true. Lengths must
+/// match; a short `source` must not grow `destination` and hide a bug.
+pub(crate) fn or_merge_flags(destination: &mut [bool], source: &[bool]) {
+    debug_assert_eq!(destination.len(), source.len());
+    for (dest, src) in destination.iter_mut().zip(source) {
+        if *src {
+            *dest = true;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +406,19 @@ mod tests {
         ] {
             assert!(page.intersects_rect(&mark, DEFAULT_EDGE_PADDING));
         }
+    }
+
+    #[test]
+    fn regions_with_no_destroyed_content_keeps_only_untouched_boxes() {
+        let mut rs = RegionSet::new(3);
+        rs.push(RedactionRegion::from_rect(0.0, 0.0, 10.0, 10.0, None));
+        rs.push(RedactionRegion::from_rect(20.0, 20.0, 30.0, 30.0, None));
+        rs.push(RedactionRegion::from_rect(40.0, 40.0, 50.0, 50.0, None));
+        let still_checked =
+            rs.regions_with_no_destroyed_content(&[true, false, false], &[false, false, true]);
+        assert_eq!(still_checked.page_index, 3);
+        assert_eq!(still_checked.len(), 1);
+        assert_eq!(still_checked.regions[0].bbox, [20.0, 20.0, 30.0, 30.0]);
     }
 
     #[test]

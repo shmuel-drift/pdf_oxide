@@ -9,8 +9,11 @@
 //!    region and re-emits survivors with absolute `Tm`, no `TJ` deltas
 //!    (G1/G2). A composite/Type0/unknown font ⇒ **hard refusal**
 //!    (`Err`), never a silent pass-through (feature plan §9 risk 6).
-//! 3. `serialize` re-serializes survivors (binary-safe strings, G6).
-//! 4. `overlay` maps each page-space region through the inverse of the
+//! 3. Vector paths/`sh` in a rectangle that still has its letters (this
+//!    helper does not burn images) are refused. Paint in a rectangle that
+//!    already lost glyphs may remain (underline / frame / page fill).
+//! 4. `serialize` re-serializes survivors (binary-safe strings, G6).
+//! 5. `overlay` maps each page-space region through the inverse of the
 //!    CTM left active at stream end, then appends one opaque block per
 //!    region *after* the pruned content so the redacted area is visibly
 //!    marked (G7) and the underlying bytes are already gone — not merely
@@ -141,8 +144,10 @@ impl FontMetrics for FontInfoMetrics {
 /// - [`Error::Unsupported`] — a text show used a composite/Type0/unknown
 ///   font while regions exist; redaction is **refused** rather than risk
 ///   a silent under-redaction (feature plan §9 risk 6, fail closed).
-///   Intersecting vector paint or `sh` is refused the same way (paths are
-///   not destroyed).
+///   Intersecting vector paint or `sh` in a rectangle that did not strip
+///   glyphs is refused the same way (paths are not destroyed). This helper
+///   does not burn images, so a box with only a JPEG still fails closed on
+///   leftover strokes.
 /// - [`Error::ParseError`] — the content stream did not parse.
 pub fn redact_content_stream(
     content: &[u8],
@@ -161,14 +166,22 @@ pub fn redact_content_stream(
         ));
     }
 
-    refuse_intersecting_unburnable(
-        &ops,
-        Matrix::identity(),
-        regions,
-        opts.edge_padding,
-        None,
-        None,
-    )?;
+    // Drive's apply path burns JPEG/Flate via `burn_stream`. This helper
+    // only rewrites text, so every image-destroyed flag stays false: a
+    // stroke over a picture still refuses here.
+    let no_pixels_burned = vec![false; regions.len()];
+    let boxes_needing_paint_check =
+        regions.regions_with_no_destroyed_content(&te.stripped_glyphs_by_region, &no_pixels_burned);
+    if !boxes_needing_paint_check.is_empty() {
+        refuse_intersecting_unburnable(
+            &ops,
+            Matrix::identity(),
+            &boxes_needing_paint_check,
+            opts.edge_padding,
+            None,
+            None,
+        )?;
+    }
 
     let mut body = Vec::with_capacity(content.len());
     for op in &te.operators {
@@ -303,6 +316,36 @@ mod tests {
         assert!(matches!(err, Error::Unsupported(_)), "expected path refusal, got {err:?}");
         let msg = err.to_string();
         assert!(msg.contains("vector path"), "{msg}");
+    }
+
+    #[test]
+    fn typed_secret_plus_stroke_in_same_region_saves() {
+        // Stroke must sit in the SAME box as TOPSECRET (underline under the word).
+        // Do not use (10,10): that is a different corner and already covered by
+        // path_outside_region_does_not_block_text_redaction. Do not assert `b"10"`:
+        // that matches `/F1 10 Tf` even if the stroke is gone.
+        let doc = b"100 698 m 145 698 l S\nBT\n/F1 10 Tf\n1 0 0 1 100 700 Tm\n(TOPSECRET) Tj\nET\n";
+        let regions = one_region(90.0, 695.0, 160.0, 715.0);
+        let (out, report) =
+            redact_content_stream(doc, &regions, &RedactionOptions::default(), &Stub).unwrap();
+        assert_eq!(report.glyphs_removed, 9);
+        assert_absent(&out, b"TOPSECRET");
+        assert!(
+            out.windows(3).any(|w| w == b"698"),
+            "leftover stroke may remain: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
+    fn stripped_region_does_not_excuse_a_path_only_region() {
+        let doc = b"10 10 m 40 10 l S\nBT\n/F1 10 Tf\n1 0 0 1 100 700 Tm\n(TOPSECRET) Tj\nET\n";
+        let mut rs = RegionSet::new(0);
+        rs.push(RedactionRegion::from_rect(90.0, 695.0, 160.0, 715.0, Some([0.0, 0.0, 0.0])));
+        rs.push(RedactionRegion::from_rect(0.0, 0.0, 50.0, 50.0, Some([0.0, 0.0, 0.0])));
+        let err = redact_content_stream(doc, &rs, &RedactionOptions::default(), &Stub).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert!(err.to_string().contains("vector path"), "{err}");
     }
 
     #[test]

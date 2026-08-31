@@ -156,6 +156,26 @@ pub fn classify_image_wipes(
     }
 }
 
+/// One flag per region: this image placement would overwrite pixels in
+/// that rectangle (a non-Keep wipe). Used only after a successful burn
+/// so an unburnable codec cannot mark the box as “pixels destroyed.”
+pub(crate) fn regions_that_burn_this_image(
+    image_ctm: &Matrix,
+    regions: &RegionSet,
+    min_padding: f32,
+) -> Vec<bool> {
+    let mut hits = vec![false; regions.len()];
+    for (i, r) in regions.regions.iter().enumerate() {
+        let mut one = RegionSet::new(regions.page_index);
+        one.push(*r);
+        let wipes = classify_image_wipes(image_ctm, &one, min_padding);
+        if wipes.iter().any(|w| !matches!(w, ImageRedaction::Keep)) {
+            hits[i] = true;
+        }
+    }
+    hits
+}
+
 /// Decide what to do with an image whose unit square is mapped to the
 /// page by `image_ctm` (the composed CTM at the `Do`/`BI`), against the
 /// page's regions.
@@ -403,6 +423,23 @@ mod tests {
         regions.push(RedactionRegion::from_rect(0.0, 0.0, 10.0, 10.0, None));
         let _ = classify_image_placement(&ctm, &regions, DEFAULT_EDGE_PADDING);
         let _ = invert_affine(&ctm);
+    }
+
+    #[test]
+    fn regions_that_burn_this_image_marks_only_overlapping_boxes() {
+        let ctm = Matrix {
+            a: 100.0,
+            b: 0.0,
+            c: 0.0,
+            d: 100.0,
+            e: 0.0,
+            f: 0.0,
+        };
+        let mut rs = RegionSet::new(0);
+        rs.push(RedactionRegion::from_rect(10.0, 10.0, 40.0, 40.0, None));
+        rs.push(RedactionRegion::from_rect(500.0, 500.0, 520.0, 520.0, None));
+        let hits = regions_that_burn_this_image(&ctm, &rs, DEFAULT_EDGE_PADDING);
+        assert_eq!(hits, vec![true, false]);
     }
 
     #[test]

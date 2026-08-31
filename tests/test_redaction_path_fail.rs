@@ -247,3 +247,30 @@ fn shading_with_matrix_fails_even_if_bbox_misses() {
         .expect_err("shading /Matrix is unprovable");
     assert!(err.to_string().contains("shading"), "{err}");
 }
+
+#[test]
+fn typed_text_plus_underline_in_same_box_saves() {
+    let contents = b"10 698 m 160 698 l S\nBT\n/F1 10 Tf\n1 0 0 1 100 700 Tm\n(TOPSECRET) Tj\nET\n";
+    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\n".to_vec();
+    let src = page_pdf("[0 0 612 792]", contents, &[font], "/Font << /F1 5 0 R >>");
+    let mut ed = DocumentEditor::from_bytes(src).unwrap();
+    ed.add_redaction(0, [90.0, 695.0, 160.0, 715.0], None)
+        .unwrap();
+    ed.apply_redactions_destructive(RedactionOptions::default())
+        .expect("underline must not block stripped text");
+    let out = save_raw(&mut ed);
+    let doc = pdf_oxide::PdfDocument::from_bytes(out.clone()).unwrap();
+    let text = doc.extract_text(0).unwrap_or_default();
+    if text.is_empty() {
+        assert!(
+            !out.windows(9).any(|w| w == b"TOPSECRET"),
+            "secret bytes still present without extracted text"
+        );
+    } else {
+        assert!(!text.contains("TOPSECRET"), "secret still extractable: {text}");
+    }
+    assert!(
+        out.windows(3).any(|w| w == b"698"),
+        "underline stroke and its 698 coordinates must survive"
+    );
+}

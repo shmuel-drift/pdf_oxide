@@ -313,6 +313,42 @@ fn jpeg_inside_form_is_burned() {
 }
 
 #[test]
+fn renamed_form_resources_are_available_to_leftover_path_walk() {
+    let w = 16u32;
+    let h = 16u32;
+    let jpeg = encode_jpeg_rgb(w, h, &magenta_on_green(w, h));
+    let page_c = b"q 1 0 0 1 0 0 cm /Fm1 Do Q q 1 0 0 1 32 0 cm /Fm1 Do Q";
+    let form_c = b"q 8 0 0 8 0 0 cm /Im1 Do Q 2 12 m 14 12 l S";
+    let pdf = assemble_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>\n".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 48 16] \
+           /Contents 4 0 R /Resources << /XObject << /Fm1 5 0 R >> >> >>\n"
+            .to_vec(),
+        stream_obj("", page_c),
+        stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 16 16] \
+             /Resources << /XObject << /Im1 6 0 R >> >>",
+            form_c,
+        ),
+        image_xobject("DCTDecode", w, h, "DeviceRGB", 8, &jpeg),
+    ]);
+
+    let mut ed = DocumentEditor::from_bytes(pdf).unwrap();
+    ed.add_redaction(0, [0.0, 0.0, 8.0, 8.0], None).unwrap();
+    ed.add_redaction(0, [10.0, 10.0, 16.0, 14.0], None).unwrap();
+    let err = ed
+        .apply_redactions_destructive(RedactionOptions::default())
+        .expect_err("undestroyed Form path must refuse the apply");
+    let msg = err.to_string();
+    assert!(msg.contains("vector path"), "{msg}");
+    assert!(!msg.contains("no XObject resource"), "{msg}");
+
+    let out = save_raw(&mut ed);
+    assert!(contains_bytes(&out, &jpeg), "failed apply must roll back the burned JPEG");
+}
+
+#[test]
 fn form_page_scale_form_translate_maps_holes() {
     // Crate multiply is self-then-other (same as `cm`): Form /Matrix T(2,1)
     // then page S(32) → image at [64,32]–[96,64]. Swapped order would put
@@ -663,4 +699,111 @@ fn encrypted_without_auth_fails_apply() {
         .expect_err("unauthenticated encrypt must fail");
     let msg = err.to_string().to_lowercase();
     assert!(msg.contains("encrypt") || msg.contains("password"), "unexpected error: {err}");
+}
+
+#[test]
+fn jpeg_plus_page_fill_same_box_saves() {
+    let w = 64u32;
+    let h = 64u32;
+    let jpeg = encode_jpeg_rgb(w, h, &magenta_on_green(w, h));
+    let extra = format!(" 0 0 {w} {h} re f");
+    let src = jpeg_page_pdf(w, h, &jpeg, &extra, None);
+    let mut ed = DocumentEditor::from_bytes(src).unwrap();
+    ed.add_redaction(0, [16.0, 16.0, 48.0, 48.0], None).unwrap();
+    let report = ed
+        .apply_redactions_destructive(RedactionOptions::default())
+        .expect("white fill must not block JPEG burn");
+    assert!(report.images_modified >= 1, "report = {report:?}");
+    let out = save_raw(&mut ed);
+    assert!(!has_magenta(&extracted_rgb(&out, 0)), "secret pixels must be burned");
+    assert!(
+        !contains_bytes(&out, &jpeg),
+        "original JPEG stream must be absent from the file"
+    );
+}
+
+#[test]
+fn jpeg_box_and_path_title_box_same_apply_refuses() {
+    let w = 64u32;
+    let h = 64u32;
+    let jpeg = encode_jpeg_rgb(w, h, &magenta_on_green(w, h));
+    let contents = format!("q {w} 0 0 {h} 0 0 cm /Im1 Do Q 0 80 40 10 re f");
+    let src = assemble_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>\n".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} 100] \
+             /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >>\n"
+        )
+        .into_bytes(),
+        stream_obj("", contents.as_bytes()),
+        image_xobject("DCTDecode", w, h, "DeviceRGB", 8, &jpeg),
+    ]);
+    let mut ed = DocumentEditor::from_bytes(src).unwrap();
+    ed.add_redaction(0, [16.0, 16.0, 48.0, 48.0], None).unwrap();
+    ed.add_redaction(0, [0.0, 80.0, 40.0, 90.0], None).unwrap();
+    ed.apply_redactions_destructive(RedactionOptions::default())
+        .expect_err("outlined title box must fail the whole apply");
+    let out = save_raw(&mut ed);
+    assert!(has_magenta(&extracted_rgb(&out, 0)), "failed apply must roll back JPEG burn");
+}
+
+#[test]
+fn jpeg_and_path_title_one_fat_box_saves_with_title_leftover() {
+    // Accepted leftover-paint hole: one box covering the JPEG *and* the
+    // outlined title path. Pixels burn; the title `re f` may remain.
+    let w = 64u32;
+    let h = 64u32;
+    let jpeg = encode_jpeg_rgb(w, h, &magenta_on_green(w, h));
+    let contents = format!("q {w} 0 0 {h} 0 0 cm /Im1 Do Q 0 80 40 10 re f");
+    let src = assemble_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>\n".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} 100] \
+             /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >>\n"
+        )
+        .into_bytes(),
+        stream_obj("", contents.as_bytes()),
+        image_xobject("DCTDecode", w, h, "DeviceRGB", 8, &jpeg),
+    ]);
+    let mut ed = DocumentEditor::from_bytes(src).unwrap();
+    ed.add_redaction(0, [0.0, 0.0, 64.0, 100.0], None).unwrap();
+    let report = ed
+        .apply_redactions_destructive(RedactionOptions::default())
+        .expect("fat box that burned pixels may keep title path");
+    assert!(report.images_modified >= 1, "report = {report:?}");
+    let out = save_raw(&mut ed);
+    assert!(!has_magenta(&extracted_rgb(&out, 0)), "secret pixels must be burned");
+    assert!(
+        !contains_bytes(&out, &jpeg),
+        "original JPEG stream must be absent from the file"
+    );
+    assert!(
+        out.windows(2).any(|w| w == b"80") && out.windows(2).any(|w| w == b"re"),
+        "outlined title path must survive as leftover paint"
+    );
+}
+
+#[test]
+fn typed_glyphs_do_not_skip_inline_bi_refuse() {
+    let contents = b"BT /F1 10 Tf 1 0 0 1 0 20 Tm (HI) Tj ET\nq 10 0 0 10 0 0 cm BI /W 2 /H 2 /CS /DeviceRGB /BPC 8 ID \x00\xff\x00\x00\xff\x00\x00\xff\x00\x00\xff\x00 EI Q";
+    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\n".to_vec();
+    let pdf = assemble_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>\n".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 30] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\n".to_vec(),
+        stream_obj("", contents),
+        font,
+    ]);
+    let mut ed = DocumentEditor::from_bytes(pdf).unwrap();
+    ed.add_redaction(0, [0.0, 0.0, 20.0, 30.0], None).unwrap();
+    let err = ed
+        .apply_redactions_destructive(RedactionOptions::default())
+        .expect_err("BI must still refuse");
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("inline") || msg.contains("BI"),
+        "unexpected error: {msg}"
+    );
 }

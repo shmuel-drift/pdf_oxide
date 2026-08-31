@@ -8,11 +8,12 @@
 //!
 //! `apply_redactions_destructive` removes intersecting vector text and
 //! burns JPEG/Flate image pixels under each rectangle, then paints an
-//! opaque overlay. Intersecting vector **paint** (charts, lines, fills)
-//! and unprovable/`sh` shadings **fail closed** — overlay-only would
-//! fake a redaction (`path_prune` is still planning-only, not a destroy
-//! path). Document sanitization (`sanitize_catalog` / `sanitize_document`)
-//! is a **separate** API — apply does not run it.
+//! opaque overlay. Leftover underlines/fills may remain when that box
+//! destroyed letters; boxes that destroyed neither glyphs nor image pixels
+//! still fail closed on intersecting vector paint and unprovable/`sh`
+//! shadings (`path_prune` is still planning-only, not a destroy path).
+//! Document sanitization (`sanitize_catalog` / `sanitize_document`) is a
+//! **separate** API — apply does not run it.
 //!
 //! One responsibility per submodule (SRP). The geometric region model is
 //! the shared input to text, image, and overlay.
