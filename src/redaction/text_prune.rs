@@ -64,8 +64,8 @@ pub struct TextPruneResult {
     pub removed_codes: Vec<(u32, u32)>,
     /// Total glyphs physically removed.
     pub glyphs_removed: usize,
-    /// Parallel to `RegionSet.regions`: this show stripped a glyph in that region.
-    pub(crate) region_glyph_hits: Vec<bool>,
+    /// One flag per region: this show stripped a glyph in that rectangle.
+    pub(crate) stripped_glyphs_by_region: Vec<bool>,
 }
 
 /// Prune one glyph sequence against the page's regions.
@@ -78,7 +78,7 @@ pub struct TextPruneResult {
 /// positional delta can encode a removed glyph (G2).
 pub fn prune_run(glyphs: &[Glyph], regions: &RegionSet, min_padding: f32) -> TextPruneResult {
     let mut out = TextPruneResult::default();
-    out.region_glyph_hits = vec![false; regions.len()];
+    out.stripped_glyphs_by_region = vec![false; regions.len()];
     let mut cur: Option<PrunedRun> = None;
     // O(1) membership for the dedup; the Vec still carries the public
     // first-seen order (Copilot review, PR #512 — avoids O(n²)).
@@ -96,9 +96,11 @@ pub fn prune_run(glyphs: &[Glyph], regions: &RegionSet, min_padding: f32) -> Tex
             if seen_codes.insert(g.code) {
                 out.removed_codes.push(g.code);
             }
+            // Mark every overlapping box, not just the first. A glyph on a
+            // shared edge excuses leftover path paint in each of those boxes.
             for (i, r) in regions.regions.iter().enumerate() {
                 if r.intersects_rect(&g.bbox, min_padding) {
-                    out.region_glyph_hits[i] = true;
+                    out.stripped_glyphs_by_region[i] = true;
                 }
             }
         } else {
@@ -242,7 +244,7 @@ mod tests {
         assert_eq!(out.runs, Vec::<PrunedRun>::new());
         assert_eq!(out.removed_codes, Vec::<(u32, u32)>::new());
         assert_eq!(out.glyphs_removed, 0);
-        assert_eq!(out.region_glyph_hits, vec![false]);
+        assert_eq!(out.stripped_glyphs_by_region, vec![false]);
     }
 
     #[test]
@@ -256,7 +258,7 @@ mod tests {
         rs.push(RedactionRegion::from_rect(80.0, 80.0, 90.0, 90.0, None));
         let out = prune_run(&glyphs, &rs, DEFAULT_EDGE_PADDING);
         assert_eq!(out.glyphs_removed, 1);
-        assert_eq!(out.region_glyph_hits, vec![true, false]);
+        assert_eq!(out.stripped_glyphs_by_region, vec![true, false]);
     }
 
     #[test]

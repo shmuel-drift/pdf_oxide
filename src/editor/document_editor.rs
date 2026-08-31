@@ -7141,8 +7141,10 @@ impl DocumentEditor {
     /// - [`Error::Unsupported`] if a redacted page shows text in a
     ///   composite/Type0/unknown font (refused rather than risk a silent
     ///   under-redaction — fail closed), or if a vector path / shading
-    ///   intersects a region (overlay-only would leave the drawing
-    ///   extractable).
+    ///   intersects a rectangle that stripped no glyphs and burned no
+    ///   pixels (overlay-only would leave that drawing extractable).
+    ///   Underlines and fills in a box that already lost letters or
+    ///   burned JPEG/Flate pixels do not refuse.
     /// - [`Error::InvalidPdf`]/[`Error::ParseError`] on an unreadable
     ///   page or content stream.
     pub fn apply_redactions_destructive(
@@ -7166,6 +7168,25 @@ impl DocumentEditor {
         self.g6_unreferenced_replaced(&replaced);
         self.is_modified = true;
         Ok(total)
+    }
+
+    /// Undo object-graph writes from a failed image burn or paint refuse
+    /// so apply leaves the document unchanged.
+    fn restore_page_apply_snapshot(
+        &mut self,
+        objects: HashMap<u32, Object>,
+        next_object_id: u32,
+        orphans: HashSet<u32>,
+        rebinds: HashMap<usize, image_redact::XObjectPatch>,
+        drop_preview: HashSet<usize>,
+        replaced: HashSet<u32>,
+    ) {
+        self.modified_objects = objects;
+        self.next_object_id = next_object_id;
+        self.redacted_orphan_ids = orphans;
+        self.redacted_xobject_rebinds = rebinds;
+        self.redacted_drop_preview = drop_preview;
+        self.burn_replaced_ids = replaced;
     }
 
     /// Destructively apply queued redactions (programmatic rectangles +
@@ -7232,7 +7253,8 @@ impl DocumentEditor {
         let final_ctm = te.final_ctm;
         let glyphs_removed = te.glyphs_removed;
         let bytes_removed = te.bytes_removed;
-        let glyph_region_hits = te.glyph_region_hits.clone();
+        // `burn_stream` takes `te.operators`; keep the per-box glyph flags.
+        let stripped_glyphs_by_region = te.stripped_glyphs_by_region.clone();
         let resources = self.resolve_page_resources(src)?;
 
         let burn = {
@@ -7252,20 +7274,28 @@ impl DocumentEditor {
             match result {
                 Ok(b) => b,
                 Err(e) => {
-                    self.modified_objects = objects_snapshot;
-                    self.next_object_id = next_id_snapshot;
-                    self.redacted_orphan_ids = orphans_snapshot;
-                    self.redacted_xobject_rebinds = rebinds_snapshot;
-                    self.redacted_drop_preview = drop_snapshot;
-                    self.burn_replaced_ids = replaced_snapshot;
+                    self.restore_page_apply_snapshot(
+                        objects_snapshot,
+                        next_id_snapshot,
+                        orphans_snapshot,
+                        rebinds_snapshot,
+                        drop_snapshot,
+                        replaced_snapshot,
+                    );
                     return Err(e);
                 },
             }
         };
 
-        let leftover = rs.leftover_paint_targets(&glyph_region_hits, &burn.image_region_hits);
-        if !leftover.is_empty() {
-            let leftover_resources = {
+        // Destroy first (glyphs + pixels), then refuse strokes/fills only in
+        // boxes that still have extractable content. Patch `/XObject` so the
+        // Form walk sees the names `burn_stream` wrote into `burn.ops`.
+        let boxes_needing_paint_check = rs.regions_with_no_destroyed_content(
+            &stripped_glyphs_by_region,
+            &burn.burned_pixels_by_region,
+        );
+        if !boxes_needing_paint_check.is_empty() {
+            let resources_after_burn = {
                 let mut res = resources.clone();
                 if !burn.xobject_patch.is_empty() {
                     let mut xo = self.xobject_entries(&res)?;
@@ -7275,21 +7305,23 @@ impl DocumentEditor {
                 res
             };
             let mut visiting = std::collections::HashSet::new();
-            if let Err(e) = self.refuse_leftover_paint(
+            if let Err(e) = self.refuse_unburnable_paint_including_forms(
                 &burn.ops,
-                &leftover_resources,
+                &resources_after_burn,
                 Matrix::identity(),
-                &leftover,
+                &boxes_needing_paint_check,
                 opts.edge_padding,
                 &mut visiting,
                 0,
             ) {
-                self.modified_objects = objects_snapshot;
-                self.next_object_id = next_id_snapshot;
-                self.redacted_orphan_ids = orphans_snapshot;
-                self.redacted_xobject_rebinds = rebinds_snapshot;
-                self.redacted_drop_preview = drop_snapshot;
-                self.burn_replaced_ids = replaced_snapshot;
+                self.restore_page_apply_snapshot(
+                    objects_snapshot,
+                    next_id_snapshot,
+                    orphans_snapshot,
+                    rebinds_snapshot,
+                    drop_snapshot,
+                    replaced_snapshot,
+                );
                 return Err(e);
             }
         }

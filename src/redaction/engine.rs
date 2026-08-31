@@ -9,9 +9,9 @@
 //!    region and re-emits survivors with absolute `Tm`, no `TJ` deltas
 //!    (G1/G2). A composite/Type0/unknown font ⇒ **hard refusal**
 //!    (`Err`), never a silent pass-through (feature plan §9 risk 6).
-//! 3. Leftover vector paint (paths/`sh`) in a region that did **not**
-//!    strip glyphs is refused; paint in a region that already had its
-//!    glyphs removed is allowed to remain (word-only Save rule).
+//! 3. Vector paths/`sh` in a rectangle that still has its letters (this
+//!    helper does not burn images) are refused. Paint in a rectangle that
+//!    already lost glyphs may remain (underline / frame / page fill).
 //! 4. `serialize` re-serializes survivors (binary-safe strings, G6).
 //! 5. `overlay` maps each page-space region through the inverse of the
 //!    CTM left active at stream end, then appends one opaque block per
@@ -144,8 +144,10 @@ impl FontMetrics for FontInfoMetrics {
 /// - [`Error::Unsupported`] — a text show used a composite/Type0/unknown
 ///   font while regions exist; redaction is **refused** rather than risk
 ///   a silent under-redaction (feature plan §9 risk 6, fail closed).
-///   Intersecting vector paint or `sh` in a region that did not strip
-///   glyphs is refused the same way (paths are not destroyed).
+///   Intersecting vector paint or `sh` in a rectangle that did not strip
+///   glyphs is refused the same way (paths are not destroyed). This helper
+///   does not burn images, so a box with only a JPEG still fails closed on
+///   leftover strokes.
 /// - [`Error::ParseError`] — the content stream did not parse.
 pub fn redact_content_stream(
     content: &[u8],
@@ -164,13 +166,17 @@ pub fn redact_content_stream(
         ));
     }
 
-    let image_hits = vec![false; regions.len()];
-    let leftover = regions.leftover_paint_targets(&te.glyph_region_hits, &image_hits);
-    if !leftover.is_empty() {
+    // Drive's apply path burns JPEG/Flate via `burn_stream`. This helper
+    // only rewrites text, so every image-destroyed flag stays false: a
+    // stroke over a picture still refuses here.
+    let no_pixels_burned = vec![false; regions.len()];
+    let boxes_needing_paint_check =
+        regions.regions_with_no_destroyed_content(&te.stripped_glyphs_by_region, &no_pixels_burned);
+    if !boxes_needing_paint_check.is_empty() {
         refuse_intersecting_unburnable(
             &ops,
             Matrix::identity(),
-            &leftover,
+            &boxes_needing_paint_check,
             opts.edge_padding,
             None,
             None,

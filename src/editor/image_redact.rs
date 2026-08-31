@@ -13,11 +13,11 @@ use crate::redaction::image_burn::{
     assert_image_burnable, burn_image_wipes, burned_xobject, MAX_FORM_DEPTH,
 };
 use crate::redaction::image_prune::{
-    classify_image_placement, classify_image_wipes, image_wipe_region_hits, ImageRedaction,
+    classify_image_placement, classify_image_wipes, regions_that_burn_this_image, ImageRedaction,
 };
 use crate::redaction::image_walk::{form_matrix_from_dict, walk_stream_images, DoPlacement};
 use crate::redaction::path_walk::refuse_intersecting_unburnable;
-use crate::redaction::region::{merge_region_hits, RegionSet};
+use crate::redaction::region::{or_merge_flags, RegionSet};
 use crate::redaction::serialize::serialize_operator;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -50,7 +50,22 @@ pub(super) struct BurnStreamResult {
     pub images_modified: usize,
     pub xobjects_specialized: usize,
     pub replaced_ids: HashSet<u32>,
-    pub(crate) image_region_hits: Vec<bool>,
+    /// One flag per redaction rectangle: this stream actually burned
+    /// JPEG/Flate pixels in that box (set only after `burn_image_wipes`
+    /// succeeds, including nested Forms).
+    pub(crate) burned_pixels_by_region: Vec<bool>,
+}
+
+/// Mark boxes whose wipe set was written into this placement. Call only
+/// after `burn_image_wipes` succeeds — a would-wipe that then fails
+/// `assert_image_burnable` must not skip the path/`sh` check.
+fn record_burned_pixels(
+    burned_pixels_by_region: &mut [bool],
+    ctm: &Matrix,
+    regions: &RegionSet,
+    padding: f32,
+) {
+    or_merge_flags(burned_pixels_by_region, &regions_that_burn_this_image(ctm, regions, padding));
 }
 
 impl DocumentEditor {
@@ -263,6 +278,9 @@ impl DocumentEditor {
                 "Form XObject nesting exceeds {MAX_FORM_DEPTH}"
             )));
         }
+        // Path/`sh`/`gs` refuse runs after this function returns, and only
+        // for boxes that destroyed neither glyphs nor pixels. Inline `BI`
+        // still fails here: there is no burn path for it.
         let walk = walk_stream_images(&ops, initial_ctm, regions, padding);
         if walk.intersecting_inline {
             return Err(Error::Unsupported("redaction cannot burn inline (BI) images".to_string()));
@@ -273,7 +291,7 @@ impl DocumentEditor {
         let mut images_modified = 0usize;
         let mut xobjects_specialized = 0usize;
         let mut replaced_ids: HashSet<u32> = HashSet::new();
-        let mut image_region_hits = vec![false; regions.len()];
+        let mut burned_pixels_by_region = vec![false; regions.len()];
 
         let mut used_names: HashSet<String> =
             self.xobject_entries(resources)?.keys().cloned().collect();
@@ -323,7 +341,10 @@ impl DocumentEditor {
                             visiting.remove(&r.id);
                         }
                         let inner = inner?;
-                        merge_region_hits(&mut image_region_hits, &inner.image_region_hits);
+                        or_merge_flags(
+                            &mut burned_pixels_by_region,
+                            &inner.burned_pixels_by_region,
+                        );
                         inners.push((p.clone(), inner));
                     }
 
@@ -416,9 +437,11 @@ impl DocumentEditor {
                             continue;
                         };
                         let burned = burn_image_wipes(&extracted, wipes)?;
-                        merge_region_hits(
-                            &mut image_region_hits,
-                            &image_wipe_region_hits(&p.ctm, regions, padding),
+                        record_burned_pixels(
+                            &mut burned_pixels_by_region,
+                            &p.ctm,
+                            regions,
+                            padding,
                         );
                         let new_id = self.allocate_object_id();
                         self.insert_modified(new_id, burned_xobject(burned));
@@ -434,9 +457,11 @@ impl DocumentEditor {
                         let affected_len = affected.len();
                         for (p, wipes) in affected {
                             let burned = burn_image_wipes(&extracted, wipes)?;
-                            merge_region_hits(
-                                &mut image_region_hits,
-                                &image_wipe_region_hits(&p.ctm, regions, padding),
+                            record_burned_pixels(
+                                &mut burned_pixels_by_region,
+                                &p.ctm,
+                                regions,
+                                padding,
                             );
                             let new_id = self.allocate_object_id();
                             self.insert_modified(new_id, burned_xobject(burned));
@@ -480,11 +505,18 @@ impl DocumentEditor {
             images_modified,
             xobjects_specialized,
             replaced_ids,
-            image_region_hits,
+            burned_pixels_by_region,
         })
     }
 
-    pub(super) fn refuse_leftover_paint(
+    /// Fail closed on path/`sh`/unresolved `gs` under `regions`, including
+    /// nested Form XObjects.
+    ///
+    /// `regions` is already the subset that destroyed neither glyphs nor
+    /// pixels. Call this *after* `burn_stream` and pass page `/XObject`
+    /// with the burn name patch applied: cloned Forms get new `Do` names,
+    /// and walking the original names would miss paths inside those Forms.
+    pub(super) fn refuse_unburnable_paint_including_forms(
         &self,
         ops: &[Operator],
         resources: &HashMap<String, Object>,
@@ -538,7 +570,7 @@ impl DocumentEditor {
                 }
             }
             let composed = form_matrix.multiply(&d.ctm);
-            let inner = self.refuse_leftover_paint(
+            let inner = self.refuse_unburnable_paint_including_forms(
                 &form_ops,
                 &form_res,
                 composed,

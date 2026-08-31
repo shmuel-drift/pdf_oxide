@@ -22,7 +22,7 @@
 //! trait abstracts width/encoding so the security-critical logic is
 //! exhaustively unit-testable without a real document.
 
-use super::region::{merge_region_hits, RegionSet};
+use super::region::{or_merge_flags, RegionSet};
 use super::text_prune::{prune_run, Glyph, TextPruneResult};
 use crate::content::graphics_state::{GraphicsStateStack, Matrix};
 use crate::content::operators::{Operator, TextElement};
@@ -126,8 +126,9 @@ pub struct TextEngineResult {
     /// overlays appended after these operators must map page-space
     /// regions through the inverse of this matrix into stream space.
     pub final_ctm: Matrix,
-    /// Parallel to the input `RegionSet.regions` (empty if no regions).
-    pub(crate) glyph_region_hits: Vec<bool>,
+    /// One flag per input region: `true` if this stream stripped at least
+    /// one glyph whose box hit that rectangle.
+    pub(crate) stripped_glyphs_by_region: Vec<bool>,
 }
 
 /// Stable non-cryptographic hash of a font resource name → the `u32`
@@ -287,7 +288,7 @@ pub fn redact_text_stream(
     let mut ts = TextState::default();
     let mut out: Vec<Operator> = Vec::with_capacity(ops.len());
     let mut result = TextEngineResult::default();
-    result.glyph_region_hits = vec![false; regions.len()];
+    result.stripped_glyphs_by_region = vec![false; regions.len()];
 
     for op in ops {
         match op {
@@ -444,7 +445,7 @@ pub fn redact_text_stream(
                 let mut any_removed = false;
                 let mut tj_orig = 0usize;
                 let mut survived_runs = TextPruneResult::default();
-                survived_runs.region_glyph_hits = vec![false; regions.len()];
+                survived_runs.stripped_glyphs_by_region = vec![false; regions.len()];
                 for el in array {
                     match el {
                         TextElement::String(s) => {
@@ -460,9 +461,10 @@ pub fn redact_text_stream(
                             }
                             survived_runs.glyphs_removed += r.glyphs_removed;
                             survived_runs.runs.extend(r.runs);
-                            merge_region_hits(
-                                &mut survived_runs.region_glyph_hits,
-                                &r.region_glyph_hits,
+                            // One `TJ` can drop glyphs in several boxes.
+                            or_merge_flags(
+                                &mut survived_runs.stripped_glyphs_by_region,
+                                &r.stripped_glyphs_by_region,
                             );
                         },
                         TextElement::Offset(off) => {
@@ -560,7 +562,7 @@ fn account(result: &mut TextEngineResult, orig_len: usize, res: &TextPruneResult
             result.removed_codes.push(*c);
         }
     }
-    merge_region_hits(&mut result.glyph_region_hits, &res.region_glyph_hits);
+    or_merge_flags(&mut result.stripped_glyphs_by_region, &res.stripped_glyphs_by_region);
 }
 
 #[cfg(test)]
@@ -798,7 +800,7 @@ mod tests {
         let r = regions(90.0, 95.0, 300.0, 115.0);
         let out = redact_text_stream(&ops, &r, DEFAULT_EDGE_PADDING, &Stub);
         assert_eq!(out.glyphs_removed, 4);
-        assert_eq!(out.glyph_region_hits, vec![true]);
+        assert_eq!(out.stripped_glyphs_by_region, vec![true]);
         // No TJ survives → no residual offset array that could encode
         // removed-glyph advances (G2).
         assert!(!out
@@ -839,7 +841,7 @@ mod tests {
         regions.push(RedactionRegion::from_rect(99.0, 95.0, 111.0, 115.0, Some([0.0, 0.0, 0.0])));
         regions.push(RedactionRegion::from_rect(111.5, 95.0, 123.0, 115.0, Some([0.0, 0.0, 0.0])));
         let out = redact_text_stream(&ops, &regions, DEFAULT_EDGE_PADDING, &Stub);
-        assert_eq!(out.glyph_region_hits, vec![true, true]);
+        assert_eq!(out.stripped_glyphs_by_region, vec![true, true]);
     }
 
     #[test]

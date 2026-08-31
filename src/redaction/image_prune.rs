@@ -156,9 +156,10 @@ pub fn classify_image_wipes(
     }
 }
 
-/// Parallel to `RegionSet.regions`: `true` if that region produces a non-Keep wipe
-/// on this placement (the box “burned pixels”).
-pub(crate) fn image_wipe_region_hits(
+/// One flag per region: this image placement would overwrite pixels in
+/// that rectangle (a non-Keep wipe). Used only after a successful burn
+/// so an unburnable codec cannot mark the box as “pixels destroyed.”
+pub(crate) fn regions_that_burn_this_image(
     image_ctm: &Matrix,
     regions: &RegionSet,
     min_padding: f32,
@@ -425,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn image_wipe_region_hits_marks_only_overlapping_boxes() {
+    fn regions_that_burn_this_image_marks_only_overlapping_boxes() {
         let ctm = Matrix {
             a: 100.0,
             b: 0.0,
@@ -437,7 +438,7 @@ mod tests {
         let mut rs = RegionSet::new(0);
         rs.push(RedactionRegion::from_rect(10.0, 10.0, 40.0, 40.0, None));
         rs.push(RedactionRegion::from_rect(500.0, 500.0, 520.0, 520.0, None));
-        let hits = image_wipe_region_hits(&ctm, &rs, DEFAULT_EDGE_PADDING);
+        let hits = regions_that_burn_this_image(&ctm, &rs, DEFAULT_EDGE_PADDING);
         assert_eq!(hits, vec![true, false]);
     }
 
