@@ -93,5 +93,5 @@ fn open_error() {
 
 #[test]
 fn version() {
-    assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.78-fork.2");
+    assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.78-fork.3");
 }

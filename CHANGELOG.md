@@ -4,6 +4,13 @@ All notable changes to PDFOxide are documented here.
 
 ## [Unreleased]
 
+## [0.3.78-fork.3] - 2026-08-31
+
+> Fork pre-release: leftover-paint Save. If boxed letters were stripped or
+> burned, Save even if an underline, frame, or white page fill sits in the
+> box. Outlined letters and unburnable pictures still refuse. (`path_prune`
+> is still unwired.)
+
 ### Changed
 
 - **Destructive apply leftover-paint rule is per box.** If a redaction
