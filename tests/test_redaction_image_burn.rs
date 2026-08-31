@@ -709,17 +709,13 @@ fn jpeg_plus_page_fill_same_box_saves() {
     let extra = format!(" 0 0 {w} {h} re f");
     let src = jpeg_page_pdf(w, h, &jpeg, &extra, None);
     let mut ed = DocumentEditor::from_bytes(src).unwrap();
-    ed.add_redaction(0, [16.0, 16.0, 48.0, 48.0], None)
-        .unwrap();
+    ed.add_redaction(0, [16.0, 16.0, 48.0, 48.0], None).unwrap();
     let report = ed
         .apply_redactions_destructive(RedactionOptions::default())
         .expect("white fill must not block JPEG burn");
     assert!(report.images_modified >= 1, "report = {report:?}");
     let out = save_raw(&mut ed);
-    assert!(
-        !has_magenta(&extracted_rgb(&out, 0)),
-        "secret pixels must be burned"
-    );
+    assert!(!has_magenta(&extracted_rgb(&out, 0)), "secret pixels must be burned");
     assert!(
         !contains_bytes(&out, &jpeg),
         "original JPEG stream must be absent from the file"
@@ -744,16 +740,48 @@ fn jpeg_box_and_path_title_box_same_apply_refuses() {
         image_xobject("DCTDecode", w, h, "DeviceRGB", 8, &jpeg),
     ]);
     let mut ed = DocumentEditor::from_bytes(src).unwrap();
-    ed.add_redaction(0, [16.0, 16.0, 48.0, 48.0], None)
-        .unwrap();
-    ed.add_redaction(0, [0.0, 80.0, 40.0, 90.0], None)
-        .unwrap();
+    ed.add_redaction(0, [16.0, 16.0, 48.0, 48.0], None).unwrap();
+    ed.add_redaction(0, [0.0, 80.0, 40.0, 90.0], None).unwrap();
     ed.apply_redactions_destructive(RedactionOptions::default())
         .expect_err("outlined title box must fail the whole apply");
     let out = save_raw(&mut ed);
+    assert!(has_magenta(&extracted_rgb(&out, 0)), "failed apply must roll back JPEG burn");
+}
+
+#[test]
+fn jpeg_and_path_title_one_fat_box_saves_with_title_leftover() {
+    // Accepted leftover-paint hole: one box covering the JPEG *and* the
+    // outlined title path. Pixels burn; the title `re f` may remain.
+    let w = 64u32;
+    let h = 64u32;
+    let jpeg = encode_jpeg_rgb(w, h, &magenta_on_green(w, h));
+    let contents = format!("q {w} 0 0 {h} 0 0 cm /Im1 Do Q 0 80 40 10 re f");
+    let src = assemble_pdf(&[
+        b"<< /Type /Catalog /Pages 2 0 R >>\n".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {w} 100] \
+             /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >>\n"
+        )
+        .into_bytes(),
+        stream_obj("", contents.as_bytes()),
+        image_xobject("DCTDecode", w, h, "DeviceRGB", 8, &jpeg),
+    ]);
+    let mut ed = DocumentEditor::from_bytes(src).unwrap();
+    ed.add_redaction(0, [0.0, 0.0, 64.0, 100.0], None).unwrap();
+    let report = ed
+        .apply_redactions_destructive(RedactionOptions::default())
+        .expect("fat box that burned pixels may keep title path");
+    assert!(report.images_modified >= 1, "report = {report:?}");
+    let out = save_raw(&mut ed);
+    assert!(!has_magenta(&extracted_rgb(&out, 0)), "secret pixels must be burned");
     assert!(
-        has_magenta(&extracted_rgb(&out, 0)),
-        "failed apply must roll back JPEG burn"
+        !contains_bytes(&out, &jpeg),
+        "original JPEG stream must be absent from the file"
+    );
+    assert!(
+        out.windows(2).any(|w| w == b"80") && out.windows(2).any(|w| w == b"re"),
+        "outlined title path must survive as leftover paint"
     );
 }
 
@@ -769,8 +797,7 @@ fn typed_glyphs_do_not_skip_inline_bi_refuse() {
         font,
     ]);
     let mut ed = DocumentEditor::from_bytes(pdf).unwrap();
-    ed.add_redaction(0, [0.0, 0.0, 20.0, 30.0], None)
-        .unwrap();
+    ed.add_redaction(0, [0.0, 0.0, 20.0, 30.0], None).unwrap();
     let err = ed
         .apply_redactions_destructive(RedactionOptions::default())
         .expect_err("BI must still refuse");

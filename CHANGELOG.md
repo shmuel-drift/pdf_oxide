@@ -13,8 +13,8 @@ All notable changes to PDFOxide are documented here.
   glyphs nor pixels still fail closed on intersecting path/`sh`/unresolved
   `gs` paint, including Form XObjects. Unreadable fonts and unburnable image
   codecs still refuse the whole apply. (`path_prune` is still unwired.)
-  Tests: `test_redaction_path_fail`, `test_redaction_image_burn`, engine
-  leftover-paint unit tests.
+  Tests: `test_redaction_path_fail`, `test_redaction_image_burn`,
+  `redact_identity_h`, engine leftover-paint unit tests.
 - **`path_walk` matches `Operator` exhaustively** (no `_` arm). A new
   variant from upstream is a compile error instead of a silent ignore.
 

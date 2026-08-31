@@ -250,15 +250,9 @@ fn shading_with_matrix_fails_even_if_bbox_misses() {
 
 #[test]
 fn typed_text_plus_underline_in_same_box_saves() {
-    let contents =
-        b"10 698 m 160 698 l S\nBT\n/F1 10 Tf\n1 0 0 1 100 700 Tm\n(TOPSECRET) Tj\nET\n";
+    let contents = b"10 698 m 160 698 l S\nBT\n/F1 10 Tf\n1 0 0 1 100 700 Tm\n(TOPSECRET) Tj\nET\n";
     let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\n".to_vec();
-    let src = page_pdf(
-        "[0 0 612 792]",
-        contents,
-        &[font],
-        "/Font << /F1 5 0 R >>",
-    );
+    let src = page_pdf("[0 0 612 792]", contents, &[font], "/Font << /F1 5 0 R >>");
     let mut ed = DocumentEditor::from_bytes(src).unwrap();
     ed.add_redaction(0, [90.0, 695.0, 160.0, 715.0], None)
         .unwrap();
@@ -273,10 +267,7 @@ fn typed_text_plus_underline_in_same_box_saves() {
             "secret bytes still present without extracted text"
         );
     } else {
-        assert!(
-            !text.contains("TOPSECRET"),
-            "secret still extractable: {text}"
-        );
+        assert!(!text.contains("TOPSECRET"), "secret still extractable: {text}");
     }
     assert!(
         out.windows(3).any(|w| w == b"698"),
